@@ -7,7 +7,7 @@ Author: RetainNet Research & Engineering Team
 Target: Master's Thesis, Technical Audits, Scientific Reference, and Production Deployment
 Codebase Location: D:\downloads\RetainNet
 Primary Execution: python -m streamlit run dashboard.py | python main.py
-Test Suite Execution: python -m pytest -q (82 passing tests across 4 test suites)
+Test Suite Execution: python -m pytest -q (98 passing tests across 6 test suites)
 Audit & Verification Status: Fully Audited & Validated (Phases 1–5A Completed, Zero Regressions)
 
 ====================================================================================================
@@ -56,12 +56,13 @@ TABLE OF CONTENTS
        - drift_detector.py (DriftLens PSI & Kolmogorov-Smirnov detector)
    3.8 main.py (Command Line Interface with --stage2-ablation, --drop-total-charges & Sample Logging)
    3.9 dashboard.py (Enterprise Streamlit Single-Page Application - Protected Baseline 7963fc7)
-   3.10 Comprehensive Test Suites (91 Passing Tests across 5 Test Files):
+   3.10 Comprehensive Test Suites (98 Passing Tests across 6 Test Files):
        - tests/test_pipeline.py (12 Integration pipeline tests)
        - tests/test_evaluation.py (8 Mathematical metric validation tests)
        - tests/test_models.py (11 Survival model invariant & zero-event tests)
        - tests/test_final_verification.py (51 Verification tests across Tasks 1–8)
        - tests/test_security_robustness.py (9 Security, CSV injection & robustness tests)
+       - tests/test_audit_verification.py (7 Statistical & integration audit verification tests)
 
 4. EMPIRICAL BENCHMARKS & EVALUATION RESULTS
    4.1 Model Comparison Leaderboard Matrix
@@ -320,11 +321,12 @@ raising empty array interpolation errors (ValueError: array of sample points is 
 DeepHit discretizes the continuous horizon into K intervals [0, t_1), [t_1, t_2), ..., [t_{K-1}, t_K].
 The neural network outputs a softmax Probability Mass Function (PMF):
     y_hat_k(x) = P( T in Bin_k, E = 1 | x )
-Total Loss function combines two components:
-1. Log-Likelihood Loss L_1 (captures event occurrence and right-censoring):
-   L_1 = - \sum_{i=1}^N [ E_i * ln( y_hat_{k_i}(x_i) ) + (1 - E_i) * ln( 1 - \sum_{m=1}^{k_i} y_hat_m(x_i) ) ]
-2. Ranking Concordance Loss L_2 (penalizes pairwise order reversals between individuals):
-   L_2 = \sum_{i, j} A_{i, j} * eta( F(T_i | x_i) - F(T_i | x_j) )
+Implemented Loss Function:
+In RetainNet's DeepHit implementation, training optimizes the discrete-time survival log-likelihood loss L_1 (Lee et al., 2018):
+    L_1 = - (1/N) \sum_{i=1}^N [ E_i * ln( y_hat_{k_i}(x_i) + eps ) + (1 - E_i) * ln( S(bin_start_{k_i} | x_i) + eps ) ]
+where observed failure events in bin k_i maximize the PMF probability, and right-censored observations in bin k_i 
+maximize the survival probability at the beginning of the interval: S(bin_start_{k_i} | x_i) = 1 - \sum_{m < k_i} y_hat_m(x_i).
+Pairwise ranking loss (L_2) is an optional extension for competing-risk discrimination and is omitted in the single-event baseline to preserve fast and stable convex optimization.
 Survival curve S(t | x) is derived via:
     S(t_k | x) = 1 - \sum_{m=1}^k y_hat_m(x)
 DeepHitModel accepts random_state in __init__ and seed in fit() for deterministic initialization.
@@ -662,6 +664,16 @@ RetainNet is backed by 82 automated regression and validation tests across 4 ded
      test_change3_total_charges_leakage_diagnostics, test_change4_held_out_test_set_isolation,
      test_change5_stage2_ablation_logic.
 
+5. tests/test_audit_verification.py (7 Statistical & integration audit verification tests):
+   - test_pipeline_augment_features_schema_consistency (Phase 1: cluster-augmented features schema)
+   - test_pipeline_kmeans_labels_available_without_refit (Phase 1: avoid double K-Means fitting)
+   - test_ltv_calculator_vectorized_equivalence (Phase 3: vectorized scalar vs array ARPU equivalence)
+   - test_priority_queue_risk_sorting (Phase 2: monotonic increasing 12M survival priority order)
+   - test_conformal_calibration_zero_leakage (Phase 2: CiPOT zero-leakage calibration bounds)
+   - test_amortized_cluster_priors (Phase 2: SurvivalPFN cluster-specific baseline survival)
+   - test_micro_dataset_zero_event_rule_compliance (RetainNet project rule: N>=1 and flat survival fallback)
+
+
 
 ====================================================================================================
 4. EMPIRICAL BENCHMARKS & EVALUATION RESULTS
@@ -823,14 +835,14 @@ The What-If Simulator provides a heuristic scenario model with strict financial 
 - Core Dependencies: torch, numpy, pandas, scikit-learn, lifelines, scipy, streamlit, pytest
 
 7.2 RUNNING THE FULL TEST SUITE
-Execute all 91 tests using pytest:
+Execute all 98 tests using pytest:
     python -m pytest -q
 
 Execute using unittest runner:
     python -m unittest discover tests
 
 Expected Output:
-    91 passed, 2 warnings in ~12s  (OK)
+    98 passed, 2 warnings in ~14s  (OK)
 
 7.3 RUNNING THE COMMAND LINE INTERFACE (CLI)
 1. Run standard synthetic pipeline:

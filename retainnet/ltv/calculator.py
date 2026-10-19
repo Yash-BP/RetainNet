@@ -28,7 +28,7 @@ class DynamicLTVCalculator:
         self,
         isd_matrix: np.ndarray,
         time_horizon_months: np.ndarray,
-        arpu: Optional[float] = None,
+        arpu: Optional[any] = None,
         acquisition_cost: Optional[float] = None
     ) -> np.ndarray:
         arpu_val = arpu if arpu is not None else self.default_arpu
@@ -49,7 +49,18 @@ class DynamicLTVCalculator:
             return np.zeros(len(isd_arr)) - ac_val
 
         discount_factors = 1.0 / np.power(1.0 + d, time_arr)
-        discounted_monthly_rev = isd_arr * (arpu_val * discount_factors[np.newaxis, :])
+
+        # Support scalar or 1D array of customer ARPUs
+        if isinstance(arpu_val, (int, float, np.floating)):
+            arpu_matrix = float(arpu_val) * discount_factors[np.newaxis, :]
+        else:
+            arpu_arr = np.asarray(arpu_val, dtype=float)
+            if arpu_arr.ndim == 1:
+                arpu_matrix = arpu_arr[:, np.newaxis] * discount_factors[np.newaxis, :]
+            else:
+                arpu_matrix = arpu_arr * discount_factors[np.newaxis, :]
+
+        discounted_monthly_rev = isd_arr * arpu_matrix
 
         if len(time_arr) == 1:
             integral = discounted_monthly_rev[:, 0]
@@ -87,10 +98,20 @@ class DynamicLTVCalculator:
                 "36_month_retention_prob_%": []
             })
 
-        ltv_values = []
-        months_12_surv = []
-        months_24_surv = []
-        months_36_surv = []
+        # Vectorized LTV calculation for all customers simultaneously
+        if monthly_charges is not None:
+            charges_arr = np.asarray(monthly_charges, dtype=float)
+            if len(charges_arr) < n_customers:
+                padded = np.full(n_customers, self.default_arpu, dtype=float)
+                padded[:len(charges_arr)] = charges_arr
+                charges_arr = padded
+            elif len(charges_arr) > n_customers:
+                charges_arr = charges_arr[:n_customers]
+        else:
+            charges_arr = self.default_arpu
+
+        ltv_all = self.calculate_ltv(isd_arr[:n_customers], time_arr, arpu=charges_arr)
+        ltv_values = [float(np.round(val, 2)) for val in ltv_all]
 
         if len(time_arr) > 0:
             idx_12 = int(np.argmin(np.abs(time_arr - 12)))
@@ -99,21 +120,14 @@ class DynamicLTVCalculator:
         else:
             idx_12 = idx_24 = idx_36 = None
 
-        for i in range(n_customers):
-            c_arpu = monthly_charges[i] if (monthly_charges is not None and i < len(monthly_charges)) else self.default_arpu
-            c_ltv = self.calculate_ltv(
-                isd_arr[i:i+1, :], time_arr, arpu=c_arpu
-            )[0]
-            
-            ltv_values.append(np.round(c_ltv, 2))
-            if idx_12 is not None and idx_12 < isd_arr.shape[1]:
-                months_12_surv.append(np.round(isd_arr[i, idx_12] * 100, 1))
-                months_24_surv.append(np.round(isd_arr[i, idx_24] * 100, 1))
-                months_36_surv.append(np.round(isd_arr[i, idx_36] * 100, 1))
-            else:
-                months_12_surv.append(100.0)
-                months_24_surv.append(100.0)
-                months_36_surv.append(100.0)
+        if idx_12 is not None and idx_12 < isd_arr.shape[1]:
+            months_12_surv = [float(np.round(v, 1)) for v in isd_arr[:n_customers, idx_12] * 100.0]
+            months_24_surv = [float(np.round(v, 1)) for v in isd_arr[:n_customers, idx_24] * 100.0]
+            months_36_surv = [float(np.round(v, 1)) for v in isd_arr[:n_customers, idx_36] * 100.0]
+        else:
+            months_12_surv = [100.0] * n_customers
+            months_24_surv = [100.0] * n_customers
+            months_36_surv = [100.0] * n_customers
 
         df_report = pd.DataFrame({
             "customer_id": safe_ids,

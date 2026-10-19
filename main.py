@@ -23,7 +23,7 @@ def main():
     parser.add_argument("--dataset", choices=["synthetic", "telco"], default="synthetic",
                         help="Dataset source (default: synthetic)")
     parser.add_argument("--telco-path", type=str, default=None,
-                        help="Path to IBM Telco CSV (required if --dataset telco)")
+                        help="Path to IBM Telco or custom CSV (required if --dataset telco)")
     parser.add_argument("--model", choices=["coxph", "rsf", "deepsurv", "deephit", "all"], default="all",
                         help="Model to train (default: all)")
     parser.add_argument("--n-samples", type=int, default=2000,
@@ -64,7 +64,7 @@ def main():
         if args.telco_path is None:
             print("[ERROR] --telco-path is required when --dataset is telco")
             sys.exit(1)
-        print(f"\n[1/6] Loading IBM Telco dataset from: {args.telco_path}")
+        print(f"\n[1/6] Loading dataset from: {args.telco_path}")
         loader = TelcoDatasetLoader(filepath=args.telco_path)
         df = loader.load()
     else:
@@ -113,6 +113,10 @@ def main():
     T_filtered = result["T_filtered"]
     E_filtered = result["E_filtered"]
     cluster_labels = result["cluster_labels"]
+
+    # Ensure validation and test feature matrices match Stage 3 input schema (supports augment_features=True/False)
+    X_val_eval = hybrid.transform_features(X_val)
+    X_test_eval = hybrid.transform_features(X_test)
 
     print(f"       Clusters discovered: {args.n_clusters} archetypes")
     print(f"  Stage 2: Propensity Filtering (band: 0.30-0.70)...")
@@ -172,14 +176,14 @@ def main():
         sys.exit(1)
 
     # ──────────────────────────── VALIDATION & MODEL SELECTION ────────────────────────────
-    print(f"\n[5/7] Evaluating candidate models on validation set ({len(X_val)} samples)...")
+    print(f"\n[5/7] Evaluating candidate models on validation set ({len(X_val_eval)} samples)...")
     from retainnet.metrics import Evaluator
 
     val_results = []
     for name, model in trained_models.items():
         try:
-            val_surv = model.predict_survival_function(X_val, times)
-            val_risk = model.predict_risk(X_val)
+            val_surv = model.predict_survival_function(X_val_eval, times)
+            val_risk = model.predict_risk(X_val_eval)
             val_metrics = Evaluator.evaluate_model(
                 name, val_surv, times, T_val, E_val, risk_scores=val_risk
             )
@@ -198,12 +202,12 @@ def main():
         print(f"       Selected best model via Validation C-Index: {best_model_name} (val C-index: {best_entry.get('c_index', 0):.4f})")
 
     # ──────────────────────────── TEST SET EVALUATION ────────────────────────────
-    print(f"\n[6/7] Final unbiased evaluation on held-out test set ({len(X_test)} samples, 100% evaluated, 0% filtered)...")
+    print(f"\n[6/7] Final unbiased evaluation on held-out test set ({len(X_test_eval)} samples, 100% evaluated, 0% filtered)...")
     results_table = []
     for name, model in trained_models.items():
         try:
-            surv_matrix = model.predict_survival_function(X_test, times)
-            risk_scores = model.predict_risk(X_test)
+            surv_matrix = model.predict_survival_function(X_test_eval, times)
+            risk_scores = model.predict_risk(X_test_eval)
             metrics = Evaluator.evaluate_model(
                 name, surv_matrix, times, T_test, E_test, risk_scores=risk_scores
             )
@@ -240,8 +244,10 @@ def main():
 
     if best_model_name and best_model_name in trained_models:
         best_model = trained_models[best_model_name]
-        surv_test = best_model.predict_survival_function(X_test, times)
-        ltv_values = ltv_calc.calculate_ltv(surv_test, times)
+        surv_test = best_model.predict_survival_function(X_test_eval, times)
+        arpu_col = next((c for c in ("monthly_charges", "MonthlyCharges", "daily_sales", "sales") if c in df_test.columns), None)
+        test_arpu = pd.to_numeric(df_test[arpu_col], errors="coerce").fillna(65.0).values if arpu_col is not None else None
+        ltv_values = ltv_calc.calculate_ltv(surv_test, times, arpu=test_arpu)
 
         print(f"       Model: {best_model_name}")
         print(f"       Mean LTV:   ${np.mean(ltv_values):,.2f}")

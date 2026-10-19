@@ -69,7 +69,7 @@ class Evaluator:
             km.fit(event_times, event_observed=(1 - event_observed))
             def surv_fn(t):
                 t_arr = np.atleast_1d(t)
-                res = km.survival_function_at_times(t_arr).values
+                res = np.asarray(km.survival_function_at_times(t_arr).values, dtype=float).ravel()
                 return float(res[0]) if np.isscalar(t) else res
             return surv_fn
         else:

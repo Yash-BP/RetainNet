@@ -14,16 +14,22 @@ class ConformalSurvivalCalibrator:
             return
 
         surv_cal = np.asarray(surv_matrix_cal, dtype=float)
+        E_arr = np.asarray(E_cal, dtype=int) if E_cal is not None else np.ones(n_cal, dtype=int)
         scores = []
         
         for i in range(n_cal):
-            t_event = T_cal[i]
-            idx = int(np.abs(times_arr - t_event).argmin())
+            t_obs = float(T_cal[i])
+            event_occurred = int(E_arr[i]) == 1 if i < len(E_arr) else True
+            idx = int(np.abs(times_arr - t_obs).argmin())
             if idx < surv_cal.shape[1]:
-                predicted_s = surv_cal[i, idx]
+                predicted_s = float(surv_cal[i, idx])
             else:
                 predicted_s = 1.0
-            actual_indicator = 1.0 if T_cal[i] > times_arr[idx] else 0.0
+
+            # Censoring-aware non-conformity score:
+            # - If right-censored (E=0) at t_obs, the subject is confirmed alive up to t_obs (actual_indicator = 1.0).
+            # - If uncensored event (E=1) at t_obs, the failure occurred at t_obs (actual_indicator = 0.0).
+            actual_indicator = 0.0 if event_occurred else 1.0
             scores.append(abs(predicted_s - actual_indicator))
             
         scores = np.sort(scores)

@@ -3,8 +3,9 @@ import numpy as np
 import os
 from typing import Optional
 
+
 class TelcoDatasetLoader:
-    """Loader for the real or benchmark Telco Customer Churn dataset."""
+    """Loader for the real or benchmark Telco Customer Churn dataset (and adaptive custom CSVs)."""
     def __init__(self, filepath: Optional[str] = None):
         self.filepath = filepath
 
@@ -30,20 +31,49 @@ class TelcoDatasetLoader:
     @staticmethod
     def _parse_csv(filepath: str) -> pd.DataFrame:
         df = pd.read_csv(filepath)
-        
+
         if 'TotalCharges' in df.columns:
-            df['TotalCharges'] = pd.to_numeric(df['TotalCharges'], errors='coerce').fillna(0)
-            
+            cleaned_tc = (
+                df['TotalCharges'].astype(str)
+                .str.strip()
+                .str.replace(r"^[$€£₹\s]+", "", regex=True)
+                .str.replace(",", "", regex=False)
+            )
+            df['TotalCharges'] = pd.to_numeric(cleaned_tc, errors='coerce').fillna(0)
+
+        if 'MonthlyCharges' in df.columns and df['MonthlyCharges'].dtype == 'object':
+            cleaned_mc = (
+                df['MonthlyCharges'].astype(str)
+                .str.strip()
+                .str.replace(r"^[$€£₹\s]+", "", regex=True)
+                .str.replace(",", "", regex=False)
+            )
+            df['MonthlyCharges'] = pd.to_numeric(cleaned_mc, errors='coerce').fillna(65.0)
+
         if 'Churn' in df.columns:
-            df['event'] = (df['Churn'] == 'Yes').astype(int)
+            if pd.api.types.is_numeric_dtype(df['Churn']):
+                df['event'] = pd.to_numeric(df['Churn'], errors='coerce').fillna(0).astype(int)
+            else:
+                df['event'] = df['Churn'].astype(str).str.strip().str.lower().isin(['yes', 'true', '1', 'churn', 'churned']).astype(int)
             df = df.drop('Churn', axis=1, errors='ignore')
-            
-        if 'tenure' in df.columns:
+
+        if 'tenure' in df.columns and 'duration' not in df.columns:
             df = df.rename(columns={'tenure': 'duration'})
-            
+
         if 'customerID' in df.columns:
             df = df.drop('customerID', axis=1, errors='ignore')
-            
+
+        # If duration or event are still absent (e.g. retail/SaaS CSV passed via --telco-path), adapt via validator
+        if 'duration' not in df.columns or 'event' not in df.columns:
+            from retainnet.data.validator import validate_customer_csv
+            val_res = validate_customer_csv(df)
+            if val_res.is_valid and val_res.df is not None:
+                df = val_res.df
+                if 'duration' not in df.columns:
+                    df['duration'] = 24.0
+                if 'event' not in df.columns:
+                    df['event'] = 0
+
         return df
 
     @staticmethod

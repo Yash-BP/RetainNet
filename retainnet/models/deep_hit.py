@@ -152,11 +152,14 @@ class DeepHitModel:
             pmf = self.network(x_t).detach().cpu().numpy()
             
         cdf = np.cumsum(pmf, axis=1)
-        surv = 1.0 - cdf
+        # Anchor survival at t=0 with S(0)=1.0 and evaluate midpoint survival at bin_centers
+        # to eliminate half-bin shift bias and right-boundary collapse.
+        surv_mid = np.clip(1.0 - (cdf - 0.5 * pmf), 0.0, 1.0)
+        knot_times = np.concatenate([[0.0], self.bin_centers])
         
         isd = np.zeros((len(X_arr), len(times_arr)))
         for i in range(len(X_arr)):
-            isd[i] = np.interp(times_arr, self.bin_centers, surv[i], left=1.0, right=surv[i, -1])
+            knot_surv = np.concatenate([[1.0], surv_mid[i]])
+            isd[i] = np.interp(times_arr, knot_times, knot_surv, left=1.0, right=surv_mid[i, -1])
             
         return np.clip(isd, 0.0, 1.0)
-

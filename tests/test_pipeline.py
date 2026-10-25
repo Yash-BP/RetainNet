@@ -1,6 +1,17 @@
 """
 Integration Tests for RetainNet Pipeline.
 """
+# --- RetainNet sys.path bootstrap (strictly binds to parent project root) ---
+import os
+import sys
+
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_root_dir = os.path.abspath(os.path.join(_this_dir, ".."))
+if _root_dir in sys.path:
+    sys.path.remove(_root_dir)
+sys.path.insert(0, _root_dir)
+# ----------------------------------------------------------------------------
+
 import unittest
 import numpy as np
 from retainnet.data import SyntheticSurvivalDataGenerator, DataPreprocessingPipeline
@@ -77,7 +88,7 @@ class TestRetainNetPipeline(unittest.TestCase):
         self.assertEqual(len(conf), 4)
 
     def test_micro_dataset_filtering_support(self):
-        # Must support micro-dataset down to single row per AGENTS.md
+        # Support single-row micro-datasets without minimum row thresholds
         from retainnet.pipeline.stage2_filtering import InstanceFilteringStage
         stage2 = InstanceFilteringStage()
         X_micro = np.ones((1, 3))

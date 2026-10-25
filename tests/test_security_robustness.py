@@ -7,6 +7,17 @@ Covers:
 4. Division-by-zero & empty slice immunity in Conformal, Drift, and Amortized engines.
 5. Path traversal & directory input safety in TelcoDatasetLoader.
 """
+# --- RetainNet sys.path bootstrap (strictly binds to parent project root) ---
+import os
+import sys
+
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_root_dir = os.path.abspath(os.path.join(_this_dir, ".."))
+if _root_dir in sys.path:
+    sys.path.remove(_root_dir)
+sys.path.insert(0, _root_dir)
+# ----------------------------------------------------------------------------
+
 import unittest
 import numpy as np
 import pandas as pd

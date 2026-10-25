@@ -1,5 +1,5 @@
 """
-Verification and regression tests for RetainNet multi-phase statistical and integration audit.
+Integration and statistical regression tests for RetainNet modules.
 Covers:
 1. RetainNetHybridPipeline augment_features schema consistency across train/inference.
 2. DynamicLTVCalculator vectorized scalar vs array ARPU equivalence.
@@ -10,6 +10,17 @@ Covers:
 7. DeepHit survival curve anchoring at t=0 and midpoint bin interpolation.
 8. Dashboard 100% held-out test set evaluation and exported neural/CoxPH weights.
 """
+# --- RetainNet sys.path bootstrap (strictly binds to parent project root) ---
+import os
+import sys
+
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_root_dir = os.path.abspath(os.path.join(_this_dir, ".."))
+if _root_dir in sys.path:
+    sys.path.remove(_root_dir)
+sys.path.insert(0, _root_dir)
+# ----------------------------------------------------------------------------
+
 import unittest
 try:
     import pytest
@@ -27,7 +38,7 @@ from retainnet.models import DeepHitModel
 
 class TestAuditVerification(unittest.TestCase):
     def test_pipeline_augment_features_schema_consistency(self):
-        """Phase 1.1: Verify cluster-augmented features maintain identical schemas between train and inference."""
+        """Verify cluster-augmented features maintain identical schemas between train and inference."""
         X_train = np.random.randn(80, 6).astype(np.float32)
         T_train = np.random.uniform(5, 50, size=80).astype(np.float32)
         E_train = np.random.binomial(1, 0.4, size=80).astype(np.int32)
@@ -46,7 +57,7 @@ class TestAuditVerification(unittest.TestCase):
         assert train_res["X_filtered"].shape[1] == 6 + 4  # 6 raw + 4 cluster one-hot
 
     def test_pipeline_kmeans_labels_available_without_refit(self):
-        """Phase 1.4: Verify cluster labels are returned directly from fit_transform avoiding double K-Means fitting."""
+        """Verify cluster labels are returned directly from fit_transform avoiding double K-Means fitting."""
         X_train = np.random.randn(60, 5).astype(np.float32)
         T_train = np.random.uniform(1, 40, size=60).astype(np.float32)
         E_train = np.random.binomial(1, 0.5, size=60).astype(np.int32)
@@ -60,7 +71,7 @@ class TestAuditVerification(unittest.TestCase):
         assert len(train_res["cluster_labels_filtered"]) == len(train_res["X_filtered"])
 
     def test_ltv_calculator_vectorized_equivalence(self):
-        """Phase 3.12: Verify vectorized DynamicLTVCalculator output equivalence."""
+        """Verify vectorized DynamicLTVCalculator output equivalence."""
         n_samples = 250
         n_times = 48
         time_grid = np.linspace(1.0, 48.0, n_times)
@@ -87,7 +98,7 @@ class TestAuditVerification(unittest.TestCase):
         np.testing.assert_allclose(vectorized_ltv, loop_ltv, rtol=1e-5, atol=1e-5)
 
     def test_priority_queue_risk_sorting(self):
-        """Phase 2.8: Verify priority queue sorts customers by increasing 12M survival (highest churn risk first)."""
+        """Verify priority queue sorts customers by increasing 12M survival (highest churn risk first)."""
         customer_db = {
             "CUST-001": {"id": "CUST-001", "segment": "Loyal", "curve": [0.95, 0.90, 0.85, 0.82], "arpu": "$80", "ltv": "$1000", "urgency": "Low"},
             "CUST-002": {"id": "CUST-002", "segment": "At-Risk", "curve": [0.70, 0.50, 0.35, 0.22], "arpu": "$60", "ltv": "$300", "urgency": "High"},
@@ -112,7 +123,7 @@ class TestAuditVerification(unittest.TestCase):
         assert sorted_keys[3] == "CUST-004"  # Missing handled safely at end
 
     def test_conformal_calibration_zero_leakage(self):
-        """Phase 2.5: Verify conformal calibration calculates non-trivial bounds without NaN or leakage."""
+        """Verify conformal calibration calculates non-trivial bounds without NaN or leakage."""
         time_grid = np.linspace(1.0, 36.0, 36)
         n_cal = 50
         
@@ -153,7 +164,7 @@ class TestAuditVerification(unittest.TestCase):
         self.assertAlmostEqual(cal_events.quantile_q, 0.85, places=4)
 
     def test_amortized_cluster_priors(self):
-        """Phase 2.6: Verify amortized inference estimates cluster-specific empirical baseline survival."""
+        """Verify amortized inference estimates cluster-specific empirical baseline survival."""
         X = np.random.randn(100, 4)
         T = np.random.exponential(scale=20.0, size=100) + 1.0
         E = np.random.binomial(1, 0.7, size=100)
@@ -172,7 +183,7 @@ class TestAuditVerification(unittest.TestCase):
             assert np.all(np.diff(b_surv) <= 1e-6)
 
     def test_micro_dataset_zero_event_rule_compliance(self):
-        """Verification of RetainNet project rule: support N>=1 and zero-event flat survival fallback."""
+        """Verify single-row dataset preprocessing and zero-event flat survival fallback."""
         preprocessor = DataPreprocessingPipeline()
         single_row_df = pd.DataFrame([{
             "customer_id": "SINGLE-001",
@@ -227,7 +238,14 @@ class TestAuditVerification(unittest.TestCase):
 
     def test_dashboard_unfiltered_test_evaluation_and_exported_weights(self):
         """Verify dashboard.execute_retainnet_pipeline() evaluates 100% of held-out test set and exports model weights."""
+        import importlib.util
+        _dash_file = os.path.join(_root_dir, "dashboard.py")
         import dashboard
+        if os.path.abspath(getattr(dashboard, "__file__", "")) != os.path.abspath(_dash_file):
+            _spec = importlib.util.spec_from_file_location("dashboard", _dash_file)
+            dashboard = importlib.util.module_from_spec(_spec)
+            sys.modules["dashboard"] = dashboard
+            _spec.loader.exec_module(dashboard)
         out = dashboard.execute_retainnet_pipeline()
         # 20% of 2,500 IBM records = 500 held-out test records (0% filtered during test evaluation)
         self.assertEqual(out["dsurv_isd"].shape[0], 500)
@@ -242,6 +260,12 @@ class TestAuditVerification(unittest.TestCase):
         self.assertEqual(len(mb["cox_params"]), len(mb["feat_cols"]))
         self.assertIn("amortized_12m_priors", mb)
         self.assertEqual(len(mb["amortized_12m_priors"]), 4)
+        ibm = out["ibm_payload"]
+        self.assertIn("stage2_detail", ibm["kpi"])
+        self.assertIn("ks_pval", ibm["mlops"])
+        self.assertIn("d_cal", ibm["leaderboard"][0])
+        first_cid = ibm["primary_cid"]
+        self.assertIn("riskDrivers", ibm["customer_db"][first_cid])
 
 
 if __name__ == "__main__":

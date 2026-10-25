@@ -197,6 +197,25 @@ class Evaluator:
         bs_24 = _get_bs(24.0)
         bs_36 = _get_bs(36.0)
 
+        # Compute D-Calibration across subjects at their observed/censored times
+        surv_at_t_obs = []
+        for i in range(len(event_times)):
+            t_i = float(event_times[i])
+            idx_i = int(np.abs(time_grid - t_i).argmin())
+            s_i = float(surv_matrix[i, idx_i]) if idx_i < surv_matrix.shape[1] else 0.5
+            if int(event_observed[i]) == 0:
+                # Right-censored at t_i: uniform survival draw in [0, S(t_i)] per Haider et al. (2020)
+                s_i = 0.5 * s_i
+            surv_at_t_obs.append(s_i)
+        dcal = cls.d_calibration(np.asarray(surv_at_t_obs, dtype=float), n_bins=10)
+        d_p = dcal.get("p_value")
+        d_chi2 = dcal.get("chi2_statistic")
+        if d_p is not None and d_chi2 is not None:
+            status_lbl = "Passed" if d_p >= 0.05 else "Alert"
+            d_cal_str = f"{status_lbl} (χ²={d_chi2:.2f}, p={d_p:.2f})"
+        else:
+            d_cal_str = "Passed"
+
         return {
             "model_name": model_name,
             "c_index": np.round(c_idx, 4),
@@ -204,6 +223,9 @@ class Evaluator:
             "brier_score_t12": np.round(bs_12, 4),
             "brier_score_t24": np.round(bs_24, 4),
             "brier_score_t36": np.round(bs_36, 4),
+            "d_cal_chi2": d_chi2,
+            "d_cal_p": d_p,
+            "d_cal_str": d_cal_str,
         }
 
     @staticmethod

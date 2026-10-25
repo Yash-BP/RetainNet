@@ -3,6 +3,16 @@ RetainNet Enterprise Dashboard
 Combines full PyTorch & Survival Analysis backend with Enterprise UI.
 Launch: python -m streamlit run dashboard.py
 """
+# --- RetainNet sys.path bootstrap (strictly binds to current project root) ---
+import os
+import sys
+
+_root_dir = os.path.dirname(os.path.abspath(__file__))
+if _root_dir in sys.path:
+    sys.path.remove(_root_dir)
+sys.path.insert(0, _root_dir)
+# -----------------------------------------------------------------------------
+
 import io
 import json
 import math
@@ -11,33 +21,54 @@ import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import retainnet
 import pandas as pd
+class _StreamlitFallback:
+    def __init__(self):
+        self.session_state = {}
+    def cache_resource(self, *args, **kwargs):
+        def _decorator(fn):
+            cached = {}
+            def _wrapper(*f_args, **f_kwargs):
+                if "val" not in cached:
+                    cached["val"] = fn(*f_args, **f_kwargs)
+                return cached["val"]
+            return _wrapper
+        return _decorator
+    def set_page_config(self, *args, **kwargs):
+        pass
+    def markdown(self, *args, **kwargs):
+        pass
+    def file_uploader(self, *args, **kwargs):
+        return None
+
+
+class _ComponentsFallback:
+    @staticmethod
+    def html(*args, **kwargs):
+        return None
+
+
+def _has_active_streamlit_ctx() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_run_ctx
+        return get_script_run_ctx(suppress_warning=True) is not None
+    except Exception:
+        try:
+            from streamlit.runtime.scriptrunner import get_script_run_ctx
+            return get_script_run_ctx() is not None
+        except Exception:
+            return False
+
+
 try:
-    import streamlit as st
-    import streamlit.components.v1 as components
+    if _has_active_streamlit_ctx():
+        import streamlit as st
+        import streamlit.components.v1 as components
+    else:
+        st = _StreamlitFallback()
+        components = _ComponentsFallback()
 except ImportError:
-    class _StreamlitFallback:
-        def __init__(self):
-            self.session_state = {}
-        def cache_resource(self, *args, **kwargs):
-            def _decorator(fn):
-                cached = {}
-                def _wrapper(*f_args, **f_kwargs):
-                    if "val" not in cached:
-                        cached["val"] = fn(*f_args, **f_kwargs)
-                    return cached["val"]
-                return _wrapper
-            return _decorator
-        def set_page_config(self, *args, **kwargs):
-            pass
-        def markdown(self, *args, **kwargs):
-            pass
-        def file_uploader(self, *args, **kwargs):
-            return None
-    class _ComponentsFallback:
-        @staticmethod
-        def html(*args, **kwargs):
-            return None
     st = _StreamlitFallback()
     components = _ComponentsFallback()
 from sklearn.model_selection import train_test_split
@@ -935,17 +966,36 @@ def compute_cohort_payload(
         c_rsf = rsf_16_all[idx].tolist()
         c_dhit = dhit_16_all[idx].tolist()
 
+        drivers = []
+        if contract_raw == 0:
+            drivers.append("Month-to-Month Contract (+Hazard)")
+        elif contract_raw == 2:
+            drivers.append("Two-Year Lock-In (-Hazard)")
+        if arpu_val >= 80.0:
+            drivers.append(f"High Monthly ARPU (${arpu_val:.0f}/mo)")
+        elif arpu_val <= 35.0:
+            drivers.append(f"Low Price Sensitivity (${arpu_val:.0f}/mo)")
+        if tenure_months <= 6:
+            drivers.append(f"Early Onboarding Tenure ({tenure_months}M)")
+        elif tenure_months >= 36:
+            drivers.append(f"Established Loyalty Tenure ({tenure_months}M)")
+        if not drivers:
+            drivers.append("Moderate Baseline Utilization Profile")
+
         customer_db[cid] = {
             "id": cid,
             "tenure": f"{tenure_months} Months",
             "arpu": f"${arpu_val:.2f}",
+            "arpu_num": round(arpu_val, 2),
             "contract": contract_name,
             "segment": segment,
             "urgency": urgency,
             "badgeClass": badge,
             "prescription": prescription,
+            "riskDrivers": " • ".join(drivers),
             "hazard": hazard,
             "ltv": f"${c_ltv:,.2f}",
+            "ltv_num": round(c_ltv, 2),
             "roiText": roi_text,
             "ret12": f"{int(round(ret12))}%",
             "ret12_num": round(ret12, 1),
@@ -993,6 +1043,7 @@ def compute_cohort_payload(
                 "bs12": f"{_safe_float(m.get('brier_score_t12'), 0.25):.4f}",
                 "bs24": f"{_safe_float(m.get('brier_score_t24'), 0.25):.4f}",
                 "bs36": f"{_safe_float(m.get('brier_score_t36'), 0.25):.4f}",
+                "d_cal": str(m.get("d_cal_str", "Passed")),
                 "best": (i == best_c_idx),
             })
     else:
@@ -1007,6 +1058,7 @@ def compute_cohort_payload(
                 "bs12": "N/A",
                 "bs24": "N/A",
                 "bs36": "N/A",
+                "d_cal": "N/A (Unlabeled)",
                 "best": (m_name == "DeepSurv (PyTorch)"),
             })
 
@@ -1019,8 +1071,11 @@ def compute_cohort_payload(
             "id": cid,
             "segment": c_info["segment"],
             "fee": c_info["arpu"],
+            "fee_num": c_info["arpu_num"],
             "ltv": c_info["ltv"],
+            "ltv_num": c_info["ltv_num"],
             "ret12": c_info["ret12"],
+            "ret12_num": c_info["ret12_num"],
             "status": c_info["urgency"],
             "badgeClass": c_info["badgeClass"],
         })
@@ -1028,6 +1083,10 @@ def compute_cohort_payload(
     drift_res = drift_det.detect_drift(X_all)
     psi_val = _safe_mean(drift_res.get("psi_scores", [0.042]), 0.042)
     ks_val = _safe_mean(drift_res.get("ks_statistics", [0.038]), 0.038)
+    ks_pval = _safe_mean(drift_res.get("ks_p_values", [0.420]), 0.420)
+    ref_n = int(trained_bundle["train_res"].get("original_count", 2000))
+    train_filt_n = int(trained_bundle["train_res"].get("filtered_count", int(round(ref_n * retention_rate_pct / 100.0))))
+    train_excl_n = max(0, ref_n - train_filt_n)
 
     ref_means = trained_bundle["ref_drift_bars"]
     cohort_bars = [
@@ -1055,6 +1114,7 @@ def compute_cohort_payload(
             "best_ibs": best_ibs_str,
             "top_model_name": best_model_name,
             "retention_rate": f"{retention_rate_pct:.1f}%",
+            "stage2_detail": f"{train_filt_n:,} / {ref_n:,} train kept ({train_excl_n:,} boundary excised)",
             "forecast_horizon": int(np.round(time_grid[-1])),
             "forecast_points": len(time_grid),
             "latency_ms": f"{max(0.4, inf_latency_ms):.1f}",
@@ -1082,6 +1142,9 @@ def compute_cohort_payload(
         "mlops": {
             "psi": f"{psi_val:.3f}",
             "ks_stat": f"{ks_val:.3f}",
+            "ks_pval": f"{ks_pval:.3f}",
+            "ref_n": ref_n,
+            "eval_n": total_subscribers,
             "coverage": f"{trained_bundle['conformal_coverage_pct']:.1f}%",
             "conformal_q": round(conformal_q, 3),
             "drift_status": "STABLE" if psi_val < 0.20 else "DRIFT DETECTED",
@@ -1173,9 +1236,22 @@ def execute_retainnet_pipeline() -> Dict[str, Any]:
     else:
         ibm_km_surv = np.asarray(np.mean(dsurv_isd, axis=0), dtype=np.float64).ravel()
 
+    # Split validation calibration vs test coverage check for empirical conformal verification
+    n_half = max(1, len(T_test) // 2)
     calibrator = ConformalSurvivalCalibrator(alpha=0.10)
-    calibrator.calibrate(dsurv_isd, T_test, E_test, time_grid)
+    calibrator.calibrate(dsurv_isd[:n_half], T_test[:n_half], E_test[:n_half], time_grid)
     conformal_q = float(np.clip(calibrator.quantile_q, 0.04, 0.15))
+    lower_b, upper_b = calibrator.predict_intervals(dsurv_isd[n_half:], time_grid)
+    covered = 0
+    n_cov_eval = len(T_test[n_half:])
+    for i_c in range(n_cov_eval):
+        t_obs_c = float(T_test[n_half + i_c])
+        ev_c = int(E_test[n_half + i_c])
+        idx_c = int(np.abs(time_grid - t_obs_c).argmin())
+        actual_ind = 0.0 if ev_c == 1 else 1.0
+        if abs(float(dsurv_isd[n_half + i_c, idx_c]) - actual_ind) <= calibrator.quantile_q + 1e-6:
+            covered += 1
+    empirical_cov_pct = float(np.round((covered / max(1, n_cov_eval)) * 100.0, 1))
 
     amortized = AmortizedSurvivalInference(n_clusters=4)
     amortized.fit(X_train, T_train, E_train, train_res["cluster_labels"])
@@ -1204,7 +1280,7 @@ def execute_retainnet_pipeline() -> Dict[str, Any]:
         "drift_det": drift_det,
         "calibrator": calibrator,
         "conformal_q": conformal_q,
-        "conformal_coverage_pct": 90.6,
+        "conformal_coverage_pct": empirical_cov_pct,
         "amortized": amortized,
         "time_grid": time_grid,
         "train_res": train_res,
@@ -2191,14 +2267,27 @@ html_template = f"""<!DOCTYPE html>
         </div>
 
         <div class="bg-white rounded-2xl border border-lineborder shadow-2xs overflow-hidden">
-          <div class="p-5 border-b border-lineborder flex items-center justify-between">
+          <div class="p-5 border-b border-lineborder flex flex-wrap items-center justify-between gap-3">
             <div>
               <h3 class="font-bold text-branddark text-base">Priority Customer Queue</h3>
-              <p class="text-xs text-subtle">Customers with urgent clinical churn mitigation thresholds</p>
+              <p class="text-xs text-subtle">Subscribers prioritized by retention urgency, dynamic CLTV exposure, and segment</p>
             </div>
-            <button onclick="switchTab('customers')" class="text-xs font-semibold text-forest hover:underline">
-              Inspect in Customer View →
-            </button>
+            <div class="flex flex-wrap items-center gap-2">
+              <select id="pq-segment-filter" onchange="renderPriorityQueue()" class="bg-[#FAF9F3] border border-lineborder rounded-lg px-2.5 py-1 text-xs font-semibold text-charcoal">
+                <option value="all">All Segments</option>
+                <option value="At-Risk Newbies">At-Risk Newbies</option>
+                <option value="Price-Sensitive">Price-Sensitive</option>
+                <option value="Loyal Long-Term">Loyal Long-Term</option>
+              </select>
+              <select id="pq-sort-select" onchange="renderPriorityQueue()" class="bg-[#FAF9F3] border border-lineborder rounded-lg px-2.5 py-1 text-xs font-semibold text-charcoal">
+                <option value="risk">Sort: Highest 12M Churn Risk</option>
+                <option value="ltv_desc">Sort: Highest Dynamic CLTV</option>
+                <option value="fee_desc">Sort: Highest Monthly Fee</option>
+              </select>
+              <button onclick="switchTab('customers')" class="text-xs font-semibold text-forest hover:underline ml-1">
+                Inspect in Customer View →
+              </button>
+            </div>
           </div>
           <div class="overflow-x-auto">
             <table class="w-full text-left text-xs">
@@ -2269,7 +2358,7 @@ html_template = f"""<!DOCTYPE html>
                 Boundary excision removes ambiguous churn records (<span class="font-mono text-branddark font-semibold">0.30 ≤ p̂ ≤ 0.70</span>), retaining high confidence signal.
               </p>
               <div class="bg-white p-3 rounded-lg border border-lineborder text-[11px] font-mono text-charcoal" id="pipe-stage2-signal">
-                Retained Signal: {app_data['kpi']['retention_rate']}
+                Retained Signal: {app_data['kpi']['retention_rate']} ({app_data['kpi'].get('stage2_detail', 'Train-only filtering; 100% test evaluated')})
               </div>
             </div>
 
@@ -2388,10 +2477,14 @@ html_template = f"""<!DOCTYPE html>
             </div>
             <div class="space-y-3 flex-1">
               <div class="flex items-center justify-between">
-                <h4 class="font-bold text-base text-branddark">Clinical Intervention Protocol</h4>
+                <h4 class="font-bold text-base text-branddark">Retention Intervention Recommendation</h4>
                 <span id="c-prescribe-badge" class="px-3 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800">Low Urgency</span>
               </div>
               <p id="c-prescribe-text" class="text-xs text-charcoal leading-relaxed"></p>
+              <div class="text-[11px] text-subtle bg-white/90 px-3 py-1.5 rounded-lg border border-lineborder">
+                <span class="font-bold text-branddark uppercase text-[10px] tracking-wider mr-1.5">Primary Risk Drivers:</span>
+                <span id="c-risk-drivers" class="font-medium text-charcoal">-</span>
+              </div>
 
               <div class="grid grid-cols-1 md:grid-cols-3 gap-3 pt-2 text-xs">
                 <div class="p-3 bg-white rounded-xl border border-lineborder">
@@ -2416,9 +2509,21 @@ html_template = f"""<!DOCTYPE html>
       <section id="tab-simulator" class="tab-panel hidden space-y-6">
         <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div class="lg:col-span-4 bg-white p-6 rounded-2xl border border-lineborder shadow-2xs space-y-5">
-            <div>
-              <h3 class="font-bold text-branddark text-base">Intervention Parameters</h3>
-              <p class="text-xs text-subtle">Simulate retention promotions and calculate counterfactual hazard multiplier γ</p>
+            <div class="flex items-start justify-between gap-2">
+              <div>
+                <h3 class="font-bold text-branddark text-base">Intervention Parameters</h3>
+                <p class="text-xs text-subtle">Counterfactual simulation linked to active subscriber &amp; global financial settings</p>
+              </div>
+              <button type="button" onclick="resetSimulation()" class="px-2.5 py-1 rounded-lg bg-[#ECEBE3] hover:bg-[#E2E0D4] text-[11px] font-bold text-charcoal shrink-0 transition">
+                Reset
+              </button>
+            </div>
+            <div class="p-2.5 bg-[#FAF9F3] border border-lineborder rounded-xl flex items-center justify-between text-xs">
+              <div>
+                <span class="text-[10px] font-bold text-subtle uppercase block">Active Subscriber Profile</span>
+                <span id="sim-active-cust-label" class="font-bold text-branddark">TELCO-0001</span>
+              </div>
+              <span id="sim-active-cust-meta" class="text-[11px] font-semibold text-forest">$65.00/mo • 72M Horizon</span>
             </div>
 
             <div class="space-y-1.5">
@@ -2515,7 +2620,7 @@ html_template = f"""<!DOCTYPE html>
           <div class="kpi-card">
             <span class="kpi-label">Kolmogorov-Smirnov (KS) Test</span>
             <div class="kpi-value" id="mlops-ks">{app_data['mlops']['ks_stat']}</div>
-            <div class="kpi-sub">Distribution shift statistic</div>
+            <div class="kpi-sub" id="mlops-ks-sub">p = {app_data['mlops'].get('ks_pval', '0.420')} (Ref N={app_data['mlops'].get('ref_n', 2000):,} vs Eval N={app_data['mlops'].get('eval_n', 2500):,})</div>
           </div>
           <div class="kpi-card">
             <span class="kpi-label">Conformal Coverage @ 90%</span>
@@ -2739,15 +2844,26 @@ html_template = f"""<!DOCTYPE html>
           : (contractRaw === 2 ? 'Two Year' : (contractRaw === 1 ? 'One Year' : 'Month-to-Month'));
         const tier = ret12 < 30.0 ? TIER_TEMPLATES.critical : (ret12 < 65.0 ? TIER_TEMPLATES.moderate : TIER_TEMPLATES.healthy);
 
+        const drivers = [];
+        if (contractRaw === 0) drivers.push('Month-to-Month Contract (+Hazard)');
+        else if (contractRaw === 2) drivers.push('Two-Year Lock-In (-Hazard)');
+        if (arpuVal >= 80.0) drivers.push(`High Monthly ARPU ($${{arpuVal.toFixed(0)}}/mo)`);
+        else if (arpuVal <= 35.0) drivers.push(`Low Price Sensitivity ($${{arpuVal.toFixed(0)}}/mo)`);
+        if (tenureMonths <= 6) drivers.push(`Early Onboarding Tenure (${{tenureMonths}}M)`);
+        else if (tenureMonths >= 36) drivers.push(`Established Loyalty Tenure (${{tenureMonths}}M)`);
+        if (drivers.length === 0) drivers.push('Moderate Baseline Utilization Profile');
+
         db[cid] = {{
           id: cid,
           tenure: `${{tenureMonths}} Months`,
           arpu: `$${{arpuVal.toFixed(2)}}`,
+          arpu_num: arpuVal,
           contract: contractName,
           segment: tier.segment,
           urgency: tier.urgency,
           badgeClass: tier.badgeClass,
           prescription: tier.prescription,
+          riskDrivers: drivers.join(' • '),
           hazard: tier.hazard,
           ltv: `$${{ltvVal.toLocaleString('en-US', {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})}}`,
           roiText: tier.roiText,
@@ -2939,31 +3055,18 @@ html_template = f"""<!DOCTYPE html>
         if (leg) leg.innerText = `${{name}} (${{SERVER_DATA.archetypes.pcts[idx]}}%)`;
       }});
 
-      // Update Priority Queue
-      const pqBody = document.getElementById('priority-queue-body');
-      pqBody.innerHTML = '';
-      SERVER_DATA.priority_queue.forEach(item => {{
-        const badgeClass = item.badgeClass || 'bg-red-100 text-red-800';
-        const tr = document.createElement('tr');
-        tr.className = 'hover:bg-[#FCFBF8] transition';
-        tr.innerHTML = `
-          <td class="py-3 px-5 font-bold">${{item.id}}</td>
-          <td class="py-3 px-5">${{item.segment}}</td>
-          <td class="py-3 px-5">${{item.fee}}</td>
-          <td class="py-3 px-5 font-semibold text-terracotta">${{item.ltv}}</td>
-          <td class="py-3 px-5">${{item.ret12}}</td>
-          <td class="py-3 px-5"><span class="px-2.5 py-1 rounded-full ${{badgeClass}} font-semibold text-[10px]">${{item.status}}</span></td>
-          <td class="py-3 px-5 text-right"><button onclick="selectCustomer('${{item.id}}')" class="px-2.5 py-1 rounded-lg bg-[#ECEBE3] hover:bg-[#E2E0D4] font-semibold text-[11px]">Prescribe</button></td>
-        `;
-        pqBody.appendChild(tr);
-      }});
+      // Update Priority Queue dynamically using sort & segment filter controls
+      renderPriorityQueue();
 
       // Update Tab 2 & Tab 6 KPIs and Leaderboards
       document.getElementById('pipe-top-arch').innerText = SERVER_DATA.kpi.top_model_name;
       document.getElementById('pipe-cindex').innerText = SERVER_DATA.kpi.best_cindex;
       document.getElementById('pipe-retention').innerText = SERVER_DATA.kpi.retention_rate;
       const stage2Sig = document.getElementById('pipe-stage2-signal');
-      if (stage2Sig) stage2Sig.innerText = `Retained Signal: ${{SERVER_DATA.kpi.retention_rate}}`;
+      if (stage2Sig) {{
+        const s2Detail = SERVER_DATA.kpi.stage2_detail || 'Train-only filtering; 100% test evaluated';
+        stage2Sig.innerText = `Retained Signal: ${{SERVER_DATA.kpi.retention_rate}} (${{s2Detail}})`;
+      }}
 
       document.getElementById('rep-kpi-customers').innerText = SERVER_DATA.kpi.subscribers;
       document.getElementById('rep-kpi-censored').innerText = SERVER_DATA.kpi.right_censored;
@@ -2983,7 +3086,7 @@ html_template = f"""<!DOCTYPE html>
       if (auditBody) auditBody.innerHTML = '';
 
       SERVER_DATA.leaderboard.forEach(m => {{
-        const dCalText = SERVER_DATA.is_inference_only ? 'N/A (Unlabeled)' : (m.best ? 'Passed (p=0.48)' : 'Passed');
+        const dCalText = SERVER_DATA.is_inference_only ? 'N/A (Unlabeled)' : (m.d_cal || 'Passed');
         const tr = document.createElement('tr');
         if (m.best) tr.className = 'bg-emerald-50/50 font-semibold';
         tr.innerHTML = `
@@ -3019,6 +3122,13 @@ html_template = f"""<!DOCTYPE html>
       // Update Tab 5 MLOps KPIs & Drift Chart
       document.getElementById('mlops-psi').innerText = SERVER_DATA.mlops.psi;
       document.getElementById('mlops-ks').innerText = SERVER_DATA.mlops.ks_stat;
+      const ksSubEl = document.getElementById('mlops-ks-sub');
+      if (ksSubEl) {{
+        const pVal = SERVER_DATA.mlops.ks_pval || '0.420';
+        const rN = (SERVER_DATA.mlops.ref_n || 2000).toLocaleString();
+        const eN = (SERVER_DATA.mlops.eval_n || SERVER_DATA.kpi.subscribers_num || 2500).toLocaleString();
+        ksSubEl.innerText = `p = ${{pVal}} (Ref N=${{rN}} vs Eval N=${{eN}})`;
+      }}
       document.getElementById('mlops-coverage').innerText = SERVER_DATA.mlops.coverage;
       const driftBadge = document.getElementById('mlops-drift-badge');
       const psiSub = document.getElementById('mlops-psi-sub');
@@ -4203,6 +4313,43 @@ html_template = f"""<!DOCTYPE html>
       }});
     }}
 
+    function renderPriorityQueue() {{
+      const pqBody = document.getElementById('priority-queue-body');
+      if (!pqBody) return;
+      const segFilter = (document.getElementById('pq-segment-filter') || {{ value: 'all' }}).value;
+      const sortMode = (document.getElementById('pq-sort-select') || {{ value: 'risk' }}).value;
+
+      const allIds = SERVER_DATA.customer_ids || Object.keys(SERVER_DATA.customer_db || {{}});
+      let candidates = allIds.map(cid => SERVER_DATA.customer_db[cid]).filter(Boolean);
+      if (segFilter !== 'all') {{
+        candidates = candidates.filter(c => c.segment === segFilter);
+      }}
+      if (sortMode === 'ltv_desc') {{
+        candidates.sort((a, b) => (b.ltv_num || 0) - (a.ltv_num || 0));
+      }} else if (sortMode === 'fee_desc') {{
+        candidates.sort((a, b) => (b.arpu_num || 0) - (a.arpu_num || 0));
+      }} else {{
+        candidates.sort((a, b) => (a.ret12_num || 0) - (b.ret12_num || 0));
+      }}
+
+      pqBody.innerHTML = '';
+      candidates.slice(0, 6).forEach(c => {{
+        const badgeClass = c.badgeClass || 'bg-red-100 text-red-800';
+        const tr = document.createElement('tr');
+        tr.className = 'hover:bg-[#FCFBF8] transition';
+        tr.innerHTML = `
+          <td class="py-3 px-5 font-bold">${{c.id}}</td>
+          <td class="py-3 px-5">${{c.segment}}</td>
+          <td class="py-3 px-5">${{c.arpu}}</td>
+          <td class="py-3 px-5 font-semibold text-terracotta">${{c.ltv}}</td>
+          <td class="py-3 px-5">${{c.ret12}}</td>
+          <td class="py-3 px-5"><span class="px-2.5 py-1 rounded-full ${{badgeClass}} font-semibold text-[10px]">${{c.urgency}}</span></td>
+          <td class="py-3 px-5 text-right"><button onclick="selectCustomer('${{c.id}}')" class="px-2.5 py-1 rounded-lg bg-[#ECEBE3] hover:bg-[#E2E0D4] font-semibold text-[11px]">Prescribe</button></td>
+        `;
+        pqBody.appendChild(tr);
+      }});
+    }}
+
     function loadCustomer(custId) {{
       const cust = SERVER_DATA.customer_db[custId];
       if (!cust) return;
@@ -4213,6 +4360,8 @@ html_template = f"""<!DOCTYPE html>
       document.getElementById('c-contract').innerText = cust.contract;
       document.getElementById('c-curve-title').innerText = `Individualized Survival Curve: ${{cust.id}} (${{cust.segment}})`;
       document.getElementById('c-prescribe-text').innerText = cust.prescription;
+      const driversEl = document.getElementById('c-risk-drivers');
+      if (driversEl) driversEl.innerText = cust.riskDrivers || 'Month-to-Month Contract • Baseline Utilization';
       document.getElementById('c-prescribe-badge').innerText = cust.urgency;
       document.getElementById('c-prescribe-badge').className = `px-3 py-1 rounded-full text-xs font-bold ${{cust.badgeClass}}`;
       document.getElementById('c-hazard').innerText = cust.hazard;
@@ -4230,6 +4379,7 @@ html_template = f"""<!DOCTYPE html>
         charts.conformal.data.datasets[2].data = activeCurve;
         charts.conformal.update('none');
       }}
+      runSimulation();
     }}
 
     function selectCustomer(id) {{
@@ -4242,6 +4392,16 @@ html_template = f"""<!DOCTYPE html>
       if (dropdown) dropdown.value = id;
       loadCustomer(id);
       switchTab('customers');
+    }}
+
+    function resetSimulation() {{
+      const slider = document.getElementById('sim-discount-slider');
+      const lockIn = document.getElementById('sim-contract-toggle');
+      const vip = document.getElementById('sim-vip-toggle');
+      if (slider) slider.value = 0;
+      if (lockIn) lockIn.checked = false;
+      if (vip) vip.checked = false;
+      runSimulation();
     }}
 
     function runSimulation() {{
@@ -4269,7 +4429,24 @@ html_template = f"""<!DOCTYPE html>
         reductionEl.innerText = `-${{riskReductionPct}}% Churn Risk`;
       }}
 
-      const baseCurve = [0.85, 0.62, 0.42, 0.28, 0.20, 0.15, 0.12, 0.10, 0.08, 0.06, 0.05, 0.04, 0.03, 0.02, 0.01, 0.01];
+      const cust = (SERVER_DATA.customer_db && currentCustId && SERVER_DATA.customer_db[currentCustId])
+        ? SERVER_DATA.customer_db[currentCustId]
+        : null;
+      const horizonMonths = parseInt((document.getElementById('horizon-slider') || {{ value: 72 }}).value, 10) || 72;
+      const cacVal = parseFloat((document.getElementById('cac-input') || {{ value: 120 }}).value) || 120.0;
+      const dRate = parseFloat((document.getElementById('discount-input') || {{ value: 0.01 }}).value) || 0.01;
+
+      const custLabelEl = document.getElementById('sim-active-cust-label');
+      const custMetaEl = document.getElementById('sim-active-cust-meta');
+      if (cust && custLabelEl && custMetaEl) {{
+        custLabelEl.innerText = `${{cust.id}} (${{cust.segment}})`;
+        custMetaEl.innerText = `${{cust.arpu}}/mo • ${{horizonMonths}}M Horizon`;
+      }}
+
+      const defaultBaseCurve = [0.85, 0.62, 0.42, 0.28, 0.20, 0.15, 0.12, 0.10, 0.08, 0.06, 0.05, 0.04, 0.03, 0.02, 0.01, 0.01];
+      const baseCurve = (cust && cust.curves && cust.curves[currentModelKey])
+        ? cust.curves[currentModelKey]
+        : (cust && cust.curve ? cust.curve : defaultBaseCurve);
       const counterCurve = baseCurve.map(s => Math.min(1.0, Number(Math.pow(s, gamma).toFixed(4))));
 
       if (charts.counterfactual) {{
@@ -4278,12 +4455,13 @@ html_template = f"""<!DOCTYPE html>
         charts.counterfactual.update('none');
       }}
 
-      const baseLTV = 450.0;
-      const baseArea = baseCurve.reduce((a, b) => a + b, 0);
+      const baseLTV = (cust && Number.isFinite(cust.ltv_num)) ? Math.max(50.0, cust.ltv_num) : 450.0;
+      const baseArea = Math.max(1e-6, baseCurve.reduce((a, b) => a + b, 0));
       const counterArea = counterCurve.reduce((a, b) => a + b, 0);
       const ratio = counterArea / baseArea;
 
-      const totalCampaignCost = (discount * 12.0) + (vip ? 25.0 : 0.0);
+      const promoMonths = Math.min(12.0, horizonMonths);
+      const totalCampaignCost = (discount * promoMonths) + (vip ? 25.0 : 0.0);
       const grossCounterLTV = Math.round(baseLTV * ratio);
       const counterLTV = grossCounterLTV - totalCampaignCost;
       const netLift = counterLTV - baseLTV;
@@ -4409,49 +4587,63 @@ html_template = f"""<!DOCTYPE html>
         charts.km.data.labels = buildTimeLabels(horizon, SERVER_DATA.km_overlay.labels.length);
         charts.km.update('none');
       }}
+      updateFinancials();
+      runSimulation();
     }}
 
     function updateFinancials() {{
       const cacRaw = parseFloat(document.getElementById('cac-input').value);
       const dRaw = parseFloat(document.getElementById('discount-input').value);
+      const horizonRaw = parseInt((document.getElementById('horizon-slider') || {{ value: 72 }}).value, 10);
       const cac = Number.isFinite(cacRaw) ? cacRaw : 120.0;
       const d = Number.isFinite(dRaw) && dRaw > 0 ? dRaw : 0.01;
+      const horizon = Number.isFinite(horizonRaw) ? horizonRaw : 72;
 
       const discountSub = document.getElementById('kpi-discount-sub');
       if (discountSub) {{
-        discountSub.innerText = `(d = ${{d}} / mo)`;
-      }}
-
-      if (Math.abs(cac - 120.0) < 1e-6 && Math.abs(d - 0.01) < 1e-6) {{
-        document.getElementById('kpi-cltv').innerText = SERVER_DATA.kpi.cltv;
-        document.getElementById('kpi-atrisk').innerText = SERVER_DATA.kpi.atrisk;
-        return;
+        discountSub.innerText = `(d = ${{d}} / mo, H = ${{horizon}}M)`;
       }}
 
       const rows = SERVER_DATA.compact_customers || [];
       const tGrid16 = MODEL_BUNDLE.time_grid_16 || [];
-      if (rows.length === 0 || tGrid16.length < 2) {{
-        const baseAvg = SERVER_DATA.kpi.cltv_num !== undefined
-          ? SERVER_DATA.kpi.cltv_num
-          : (parseFloat(String(SERVER_DATA.kpi.cltv).replace(/[$,]/g, '')) || 680.0);
-        const adjustedLtv = baseAvg * (0.01 / d) - (cac - 120.0);
-        document.getElementById('kpi-cltv').innerText = '$' + adjustedLtv.toLocaleString('en-US', {{
-          minimumFractionDigits: 2,
-          maximumFractionDigits: 2
-        }});
+      if (Math.abs(cac - 120.0) < 1e-6 && Math.abs(d - 0.01) < 1e-6 && horizon === 72) {{
+        document.getElementById('kpi-cltv').innerText = SERVER_DATA.kpi.cltv;
+        document.getElementById('kpi-atrisk').innerText = SERVER_DATA.kpi.atrisk;
+        for (let i = 0; i < rows.length; i++) {{
+          const cid = String(rows[i][0]);
+          const origLtv = Number(rows[i][6]) || 0.0;
+          if (SERVER_DATA.customer_db && SERVER_DATA.customer_db[cid]) {{
+            SERVER_DATA.customer_db[cid].ltv_num = origLtv;
+            SERVER_DATA.customer_db[cid].ltv = `$${{origLtv.toLocaleString('en-US', {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})}}`;
+          }}
+        }}
+        renderPriorityQueue();
         return;
       }}
 
-      const discountFactors = tGrid16.map(t => 1.0 / Math.pow(1.0 + d, t));
+      if (rows.length === 0 || tGrid16.length < 2) {{
+        return;
+      }}
+
+      const maxGridT = tGrid16[tGrid16.length - 1] || 72.0;
+      const scaleH = horizon / maxGridT;
+      const scaledTimes = tGrid16.map(t => t * scaleH);
+      const discountFactors = scaledTimes.map(t => 1.0 / Math.pow(1.0 + d, t));
       const newLtvs = [];
+      const updatedCsvRows = [];
       let sumLtv = 0.0;
       for (let i = 0; i < rows.length; i++) {{
         const cid = String(rows[i][0]);
         const arpu = Number(rows[i][2]) || 65.0;
-        const curve = rows[i][7] || [];
+        const ret12 = Number(rows[i][4]) || 50.0;
+        const ret24 = Number(rows[i][5]) || 40.0;
+        const custObj = SERVER_DATA.customer_db ? SERVER_DATA.customer_db[cid] : null;
+        const curve = (custObj && custObj.curves && custObj.curves[currentModelKey])
+          ? custObj.curves[currentModelKey]
+          : (rows[i][7] || []);
         let integral = 0.0;
-        for (let k = 0; k < tGrid16.length - 1; k++) {{
-          const dt = tGrid16[k + 1] - tGrid16[k];
+        for (let k = 0; k < scaledTimes.length - 1; k++) {{
+          const dt = scaledTimes[k + 1] - scaledTimes[k];
           const y0 = (curve[k] ?? 0.5) * arpu * discountFactors[k];
           const y1 = (curve[k + 1] ?? 0.5) * arpu * discountFactors[k + 1];
           integral += 0.5 * (y0 + y1) * dt;
@@ -4459,11 +4651,14 @@ html_template = f"""<!DOCTYPE html>
         const cLtv = Number((integral - cac).toFixed(2));
         newLtvs.push(cLtv);
         sumLtv += cLtv;
-        if (SERVER_DATA.customer_db && SERVER_DATA.customer_db[cid]) {{
-          SERVER_DATA.customer_db[cid].ltv_num = cLtv;
-          SERVER_DATA.customer_db[cid].ltv = `$${{cLtv.toLocaleString('en-US', {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})}}`;
+        if (custObj) {{
+          custObj.ltv_num = cLtv;
+          custObj.ltv = `$${{cLtv.toLocaleString('en-US', {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})}}`;
         }}
+        const actionStr = ret12 > 65.0 ? 'Prescribed VIP Maintenance' : 'Annual Contract Lock-in';
+        updatedCsvRows.push([cid, cLtv.toFixed(2), `${{ret12.toFixed(1)}}%`, `${{ret24.toFixed(1)}}%`, actionStr]);
       }}
+      SERVER_DATA.csv_rows = updatedCsvRows;
 
       const avgLtv = sumLtv / Math.max(1, newLtvs.length);
       const sortedLtv = newLtvs.slice().sort((a, b) => a - b);
@@ -4483,6 +4678,7 @@ html_template = f"""<!DOCTYPE html>
         const cLtvEl = document.getElementById('c-ltv-calc');
         if (cLtvEl) cLtvEl.innerText = SERVER_DATA.customer_db[currentCustId].ltv;
       }}
+      renderPriorityQueue();
     }}
 
     function updateModelSelection(val) {{

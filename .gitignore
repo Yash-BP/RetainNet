@@ -1,7 +1,3 @@
-# =====================================================================
-# RetainNet — Official .gitignore
-# =====================================================================
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -54,18 +50,3 @@ desktop.ini
 .idea/
 *.sublime-project
 *.sublime-workspace
-
-# =====================================================================
-# Internal AI Agent Framework & Execution Metadata (Excluded from Public Git)
-# =====================================================================
-.agents/
-agents/
-.agent/
-.gsd/
-.gemini/
-adapters/
-scripts/
-GSD-STYLE.md
-PROJECT_RULES.md
-model_capabilities.yaml
-VERSION

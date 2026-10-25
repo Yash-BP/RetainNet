@@ -1,105 +1,21 @@
 # RetainNet
 
-**Customer churn prediction, survival analysis, and customer lifetime value estimation**
+**Continuous-Time Survival Analysis for Customer Churn & Dynamic Lifetime Value Estimation**
 
-RetainNet is a Python project that explores how survival analysis can help estimate customer churn risk and future customer value. Instead of predicting only whether a customer will leave, survival models estimate the probability that a customer remains active over time.
+RetainNet is a Python framework developed to model customer retention over continuous time rather than treating churn as a fixed-window binary classification problem. In subscription and recurring-revenue businesses, active customers at the end of an observation window are right-censored—we know how long they have stayed so far, not when they will eventually leave. RetainNet handles right-censored records directly, estimates individualized survival probability curves $S(t \mid \mathbf{x})$ across a multi-month horizon, and integrates those curves to compute discounted Customer Lifetime Value (CLTV).
 
-The project combines customer segmentation, a filtering stage, survival models, evaluation metrics, and a Streamlit dashboard.
+## Core Capabilities
 
-## Features
+- **3-Stage Hybrid Pipeline**:
+  1. **Stage 1 (`retainnet/pipeline/stage1_segmentation.py`)**: Standardizes numeric customer attributes and fits K-Means ($k=4$) to group subscribers into behavioral segments.
+  2. **Stage 2 (`retainnet/pipeline/stage2_filtering.py`)**: Trains a balanced L2-regularized logistic regression classifier on the training split and removes ambiguous boundary records ($0.30 \le \hat{p}_i \le 0.70$) before survival training. Held-out validation and test splits are never filtered.
+  3. **Stage 3 (`retainnet/models/`)**: Fits survival models on the denoised training data, including PyTorch **DeepSurv** (`deep_surv.py`), discrete-time **DeepHit** (`deep_hit.py`), **Cox Proportional Hazards**, and **Random Survival Forest** (`baselines.py`).
+- **Dynamic CLTV Engine (`retainnet/ltv/calculator.py`)**: Computes expected discounted lifetime value via trapezoidal integration over each subscriber's survival curve, accounting for monthly revenue (ARPU), monthly discount rate $d$, and Customer Acquisition Cost (CAC).
+- **Universal CSV Ingestion (`retainnet/data/validator.py`)**: Validates uploaded CSV files up to 25 MB, cleans currency symbols and thousand separators, neutralizes spreadsheet formula injection characters (`=`, `+`, `-`, `@`), and maps Telco, Retail Sales, E-Commerce, and SaaS column schemas.
+- **Evaluation & Telemetry (`retainnet/metrics/` & `retainnet/advanced/`)**: Includes Harrell's Concordance Index (C-Index), IPCW Brier Scores, Integrated Brier Score (IBS), D-Calibration, censoring-aware conformal prediction bounds (`ConformalSurvivalCalibrator`), population drift detection via PSI and Kolmogorov-Smirnov statistics (`DriftDetector`), and empirical cluster baseline priors for cold-start signups (`AmortizedSurvivalInference`).
+- **Interactive Dashboard (`dashboard.py`)**: A six-tab Streamlit interface for exploring portfolio KPIs, model benchmarks, individual customer survival curves with 90% conformal bands, a counterfactual retention scenario simulator, drift metrics, and CSV prediction exports.
 
-- Customer segmentation using K-Means.
-- A logistic-regression-based filtering stage.
-- Survival modelling with DeepSurv and DeepHit.
-- Baseline comparisons using Cox proportional hazards and Random Survival Forest, where supported by the installed dependencies.
-- Evaluation using concordance index and Brier-score-based metrics.
-- Customer lifetime value calculations using survival estimates and configurable financial assumptions.
-- A Streamlit dashboard with customer analytics and a retention scenario simulator.
-- Experimental modules for inference, conformal calibration, and data-drift detection.
-
-**Note:** The advanced modules and retention scenarios should be treated as experimental unless independently validated. Simulated intervention results are sensitivity analyses, not proof of causal business impact.
-
-## How it works
-
-1. **Segmentation:** K-Means groups customers with similar observed characteristics.
-2. **Filtering:** A logistic-regression stage selects or weights observations according to the project's filtering logic.
-3. **Survival modelling:** Models estimate customer survival over time while accounting for right-censored observations.
-4. **Evaluation:** Model performance is assessed using survival-analysis metrics.
-5. **Customer value:** Survival estimates are combined with revenue, discounting, and acquisition-cost assumptions.
-6. **Dashboard:** Results and configurable scenarios are presented through Streamlit.
-
-## Technology
-
-- Python
-- pandas and NumPy
-- scikit-learn
-- PyTorch
-- Streamlit
-- Survival-analysis libraries, depending on the selected model and installed dependencies
-- pytest
-
-## Getting started
-
-### Requirements
-
-Install a Python version supported by the project's dependencies. Python 3.10–3.13 is the range specified for this project; verify compatibility with the versions listed in `requirements.txt`.
-
-### Installation
-
-```powershell
-git clone https://github.com/Yash-BP/RetainNet.git
-cd RetainNet
-
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-### Run the dashboard
-
-```powershell
-python -m streamlit run dashboard.py
-```
-
-Streamlit will provide a local URL for opening the dashboard in your browser.
-
-### Run the tests
-
-```powershell
-python -m pytest -q
-```
-
-The repository's previously reported test run completed with 91 passing tests and two warnings. Run the suite in your own environment to verify the current result.
-
-### Run a synthetic experiment
-
-```powershell
-python main.py --dataset synthetic --model all --epochs 20 --n-samples 500
-```
-
-Check `python main.py --help` for available options. Real-data experiments require a compatible dataset and the appropriate command-line arguments.
-
-## Data and scientific assumptions
-
-Survival analysis models time until an event while accounting for right-censoring. Their reliability depends on assumptions about censoring, data quality, feature construction, and model specification.
-
-DeepSurv uses a proportional-hazards formulation. DeepHit provides a discrete-time alternative with a different modelling approach.
-
-Customer lifetime value estimates depend on the revenue, discount-rate, time-horizon, and acquisition-cost assumptions used by the implementation. They should be interpreted as model-based estimates rather than guaranteed future revenue.
-
-The retention simulator produces scenario-based estimates. It does not establish that a proposed intervention will cause the predicted improvement.
-
-## Limitations
-
-- Performance depends on the dataset, preprocessing, censoring patterns, and model configuration.
-- Synthetic benchmark results do not establish performance on real customers.
-- Some models may require additional dependencies.
-- Advanced inference and calibration modules require separate validation before their outputs are used for business decisions.
-- The project is an academic and portfolio implementation, not a production-validated decision system.
-
-## Repository structure
+## Project Structure
 
 ```text
 RetainNet/
@@ -110,16 +26,86 @@ RetainNet/
 ├── RETAINNET_FULL_PROJECT_DOCUMENTATION.txt
 ├── retainnet/
 │   ├── advanced/
+│   │   ├── amortized_inference.py
+│   │   ├── conformal_calibration.py
+│   │   └── drift_detector.py
 │   ├── data/
+│   │   ├── generator.py
+│   │   ├── pipeline.py
+│   │   ├── telco_data.py
+│   │   └── validator.py
 │   ├── ltv/
+│   │   └── calculator.py
 │   ├── metrics/
+│   │   └── evaluation.py
 │   ├── models/
+│   │   ├── baselines.py
+│   │   ├── deep_hit.py
+│   │   └── deep_surv.py
 │   └── pipeline/
+│       ├── hybrid_pipeline.py
+│       ├── stage1_segmentation.py
+│       └── stage2_filtering.py
 └── tests/
+    ├── test_audit_verification.py
+    ├── test_dataset_switching.py
+    ├── test_evaluation.py
+    ├── test_final_verification.py
+    ├── test_models.py
+    ├── test_pipeline.py
+    └── test_security_robustness.py
 ```
 
-## Project purpose
+## Setup and Installation
 
-RetainNet was developed as a final-year computer engineering project to explore survival analysis, churn modelling, and customer lifetime value estimation in a single Python application.
+Python 3.10 to 3.13 is supported. Create a virtual environment and install the required packages from `requirements.txt`:
 
-Contributions, bug reports, and suggestions are welcome.
+```bash
+python -m venv .venv
+# On Windows PowerShell:
+.\.venv\Scripts\Activate.ps1
+# On Linux / macOS:
+source .venv/bin/activate
+
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+## Usage
+
+### 1. Launch the Interactive Dashboard
+
+```bash
+python -m streamlit run dashboard.py
+```
+
+Open the local URL displayed in the terminal (default `http://localhost:8501`) to switch between the IBM Telco Benchmark cohort, a configurable Synthetic Weibull cohort, or your own uploaded CSV file.
+
+### 2. Run the Command-Line Pipeline
+
+```bash
+# Train and evaluate all models on a synthetic Weibull cohort
+python main.py --dataset synthetic --model all --epochs 50 --n-samples 1000
+
+# Run with Stage 2 ablation (compares filtered vs. unfiltered training on the same test set)
+python main.py --dataset synthetic --model all --epochs 20 --n-samples 500 --stage2-ablation
+
+# Run on a Telco or custom CSV while dropping cumulative charge proxies
+python main.py --dataset telco --telco-path data/WA_Fn-UseC_-Telco-Customer-Churn.csv --model all --drop-total-charges
+```
+
+### 3. Run the Automated Test Suite
+
+```bash
+python -m unittest discover -s tests -v
+# or using pytest:
+python -m pytest -q
+```
+
+All 119 unit and integration tests across the 7 test files run offline and verify data preprocessing, survival loss gradients, baseline hazard interpolation, CLTV integration, CSV schema validation, and dashboard state consistency.
+
+## Practical Notes & Scope
+
+- **Censoring and Collinearity**: In raw Telco datasets, cumulative `TotalCharges` closely tracks `MonthlyCharges * tenure`. Passing `--drop-total-charges` removes `TotalCharges` and `AvgMonthlyCharge` so models do not rely on a duration proxy.
+- **Scenario Simulator**: The What-If Retention Simulator in Tab 4 applies a proportional hazard multiplier $\gamma$ to explore how discounts, annual contract lock-ins, or concierge support could shift a subscriber's survival curve and net LTV. These outputs are sensitivity projections rather than causal estimates from randomized trials.
+- **Optional Dependencies**: If `scikit-survival` is not installed in the active environment, `RandomSurvivalForestBaselineModel` automatically runs in a constant-hazard baseline fallback mode (`RSF (Fallback)`) and logs a warning so benchmark tables remain transparent.

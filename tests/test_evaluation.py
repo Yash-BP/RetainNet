@@ -1,6 +1,17 @@
 """
 Unit Tests for Evaluator: C-Index, IPCW Brier Score, and IBS.
 """
+# --- RetainNet sys.path bootstrap (strictly binds to parent project root) ---
+import os
+import sys
+
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_root_dir = os.path.abspath(os.path.join(_this_dir, ".."))
+if _root_dir in sys.path:
+    sys.path.remove(_root_dir)
+sys.path.insert(0, _root_dir)
+# ----------------------------------------------------------------------------
+
 import unittest
 import numpy as np
 from retainnet.metrics import Evaluator

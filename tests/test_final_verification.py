@@ -1,20 +1,31 @@
 """
 Final Verification Tests for RetainNet Project.
 
-Task 1: Time horizon consistency
-Task 2: DeepSurv Cox partial-likelihood mathematical verification
-Task 3: Financial calculation correctness (CLTV, ARPU, CAC, discount)
+Time horizon consistency
+DeepSurv Cox partial-likelihood mathematical verification
+Financial calculation correctness (CLTV, ARPU, CAC, discount)
 """
+# --- RetainNet sys.path bootstrap (strictly binds to parent project root) ---
+import os
+import sys
+
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_root_dir = os.path.abspath(os.path.join(_this_dir, ".."))
+if _root_dir in sys.path:
+    sys.path.remove(_root_dir)
+sys.path.insert(0, _root_dir)
+# ----------------------------------------------------------------------------
+
 import unittest
 import numpy as np
 
 # ──────────────────────────────────────────────────────────────────
-# TASK 1: Verify Time Horizon Consistency
+# Section: Verify Time Horizon Consistency
 # ──────────────────────────────────────────────────────────────────
 
 class TestTimeHorizonConsistency(unittest.TestCase):
     """
-    Task 1: Time horizon consistency and quadrature resolution semantics.
+    Time horizon consistency and quadrature resolution semantics.
 
     Clarifies and verifies three distinct concepts:
     1. Forecast horizon (H): Chronological duration in calendar months over which
@@ -202,7 +213,7 @@ class TestTimeHorizonConsistency(unittest.TestCase):
 
 
 # ──────────────────────────────────────────────────────────────────
-# TASK 2: DeepSurv Cox Partial-Likelihood Mathematical Verification
+# Section: DeepSurv Cox Partial-Likelihood Mathematical Verification
 # ──────────────────────────────────────────────────────────────────
 
 class TestDeepSurvCoxLikelihoodMath(unittest.TestCase):
@@ -504,7 +515,7 @@ class TestDeepSurvCoxLikelihoodMath(unittest.TestCase):
 
 
 # ──────────────────────────────────────────────────────────────────
-# TASK 3: Financial Calculation Verification
+# Section: Financial Calculation Verification
 # ──────────────────────────────────────────────────────────────────
 
 class TestFinancialCalculations(unittest.TestCase):
@@ -640,7 +651,7 @@ class TestFinancialCalculations(unittest.TestCase):
 
 
 # ──────────────────────────────────────────────────────────────────
-# TASK 4: What-If Simulator & Counterfactual Arithmetic Verification
+# Section: What-If Simulator & Counterfactual Arithmetic Verification
 # ──────────────────────────────────────────────────────────────────
 
 class TestWhatIfSimulatorMath(unittest.TestCase):
@@ -779,7 +790,7 @@ class TestWhatIfSimulatorMath(unittest.TestCase):
 
 
 # ──────────────────────────────────────────────────────────────────
-# TASK 5: Customer Profile & CSV Export Consistency Verification
+# Section: Customer Profile & CSV Export Consistency Verification
 # ──────────────────────────────────────────────────────────────────
 
 class TestCustomerProfileAndCSVExport(unittest.TestCase):
@@ -818,7 +829,7 @@ class TestCustomerProfileAndCSVExport(unittest.TestCase):
 
 
 # ──────────────────────────────────────────────────────────────────
-# TASK 6: Financial What-If Simulator Correctness & Boundary Verification
+# Section: Financial What-If Simulator Correctness & Boundary Verification
 # ──────────────────────────────────────────────────────────────────
 
 def what_if_simulator_corrected(discount: float, lock_in: bool, vip: bool, base_ltv: float = 450.0):
@@ -873,7 +884,7 @@ def what_if_simulator_corrected(discount: float, lock_in: bool, vip: bool, base_
 
 class TestWhatIfFinancialRegressionSuite(unittest.TestCase):
     """
-    Task 6: Comprehensive verification of the 10 required financial regression cases
+    Comprehensive verification of the 10 required financial regression cases
     for the What-If Simulator and counterfactual LTV engine.
     """
 
@@ -980,12 +991,12 @@ class TestWhatIfFinancialRegressionSuite(unittest.TestCase):
 
 
 # ──────────────────────────────────────────────────────────────────
-# TASK 7: Security Verification & Data Robustness Suite
+# Section: Security Verification & Data Robustness Suite
 # ──────────────────────────────────────────────────────────────────
 
 class TestSecurityAndDataSanitizationSuite(unittest.TestCase):
     """
-    Task 7: Security regression tests covering CSV injection defense,
+    Security regression tests covering CSV injection defense,
     corrupt data handling, and secret absence.
     """
 
@@ -1076,17 +1087,17 @@ class TestSecurityAndDataSanitizationSuite(unittest.TestCase):
 
 
 # ──────────────────────────────────────────────────────────────────
-# TASK 8: Phase 5A Scientific Validation & Reproducibility Suite
+# Section: Reproducibility, Fallback Transparency & Isolation Suite
 # ──────────────────────────────────────────────────────────────────
 
-class TestPhase5AScientificValidationSuite(unittest.TestCase):
+class TestReproducibilityAndIsolationSuite(unittest.TestCase):
     """
-    Task 8: Verification suite for Phase 5A Remediation Changes:
-      - Change 1: PyTorch reproducibility via seed control in DeepSurv & DeepHit
-      - Change 2: RSF fallback transparency, warnings, and non-misleading display labels
-      - Change 3: Optional drop_total_charges configuration & leakage diagnostics
-      - Change 4: Complete held-out test set evaluation & strict isolation
-      - Change 5: Stage 2 ablation logic & metric tracking
+    Verification suite for model reproducibility and pipeline isolation:
+      - PyTorch reproducibility via seed control in DeepSurv & DeepHit
+      - RSF fallback transparency, warnings, and non-misleading display labels
+      - Optional drop_total_charges configuration & leakage diagnostics
+      - Complete held-out test set evaluation & strict isolation
+      - Stage 2 ablation logic & metric tracking
     """
 
     def setUp(self):
@@ -1098,8 +1109,8 @@ class TestPhase5AScientificValidationSuite(unittest.TestCase):
         self.X, self.T, self.E = self.pipeline.fit_transform(self.df_synthetic)
         self.times = np.linspace(1, 48, 48)
 
-    def test_change1_deepsurv_seed_reproducibility(self):
-        """Change 1: Verify DeepSurv produces identical predictions across runs with identical seed."""
+    def test_deepsurv_seed_reproducibility(self):
+        """Verify DeepSurv produces identical predictions across runs with identical seed."""
         from retainnet.models import DeepSurvModel
 
         # Run 1: seed 42
@@ -1120,8 +1131,8 @@ class TestPhase5AScientificValidationSuite(unittest.TestCase):
         np.testing.assert_allclose(surv1, surv2, rtol=1e-4, atol=1e-4,
                                    err_msg="DeepSurv survival curves differ across repeated seed=42 runs")
 
-    def test_change1_deephit_seed_reproducibility(self):
-        """Change 1: Verify DeepHit produces identical predictions across runs with identical seed."""
+    def test_deephit_seed_reproducibility(self):
+        """Verify DeepHit produces identical predictions across runs with identical seed."""
         from retainnet.models import DeepHitModel
 
         # Run 1: seed 42
@@ -1137,8 +1148,8 @@ class TestPhase5AScientificValidationSuite(unittest.TestCase):
         np.testing.assert_allclose(surv1, surv2, rtol=1e-4, atol=1e-4,
                                    err_msg="DeepHit survival curves differ across repeated seed=42 runs")
 
-    def test_change2_rsf_fallback_transparency_and_display_name(self):
-        """Change 2: RSF fallback must be explicitly disclosed, labeled, and warn the user."""
+    def test_rsf_fallback_transparency_and_display_name(self):
+        """RSF fallback must be explicitly disclosed, labeled, and warn the user."""
         import warnings
         from retainnet.models.baselines import RandomSurvivalForestBaselineModel, HAS_SKSURV
 
@@ -1165,8 +1176,8 @@ class TestPhase5AScientificValidationSuite(unittest.TestCase):
             self.assertFalse(rsf.is_fallback)
             self.assertEqual(rsf.model_display_name, "Random Survival Forest")
 
-    def test_change3_drop_total_charges_configuration(self):
-        """Change 3: drop_total_charges=True must omit TotalCharges and AvgMonthlyCharge without breaking pipeline."""
+    def test_drop_total_charges_configuration(self):
+        """drop_total_charges=True must omit TotalCharges and AvgMonthlyCharge without breaking pipeline."""
         from retainnet.data import DataPreprocessingPipeline
         import pandas as pd
 
@@ -1198,8 +1209,8 @@ class TestPhase5AScientificValidationSuite(unittest.TestCase):
         X_drop_t, _, _ = pipe_drop.transform(df_test)
         self.assertEqual(X_drop_t.shape[1], X_drop.shape[1])
 
-    def test_change3_total_charges_leakage_diagnostics(self):
-        """Change 3: Diagnostic verification distinguishing real Telco duration proxy from synthetic benchmark."""
+    def test_total_charges_leakage_diagnostics(self):
+        """Diagnostic verification distinguishing real Telco duration proxy from synthetic benchmark."""
         import pandas as pd
         from retainnet.data import TelcoDatasetLoader
 
@@ -1223,8 +1234,8 @@ class TestPhase5AScientificValidationSuite(unittest.TestCase):
         self.assertNotEqual(round(corr_bench, 4), 1.0,
                             msg="Benchmark generator synthesizes prior_tenure independently from event duration")
 
-    def test_change4_held_out_test_set_isolation(self):
-        """Change 4: Preprocessing fit on train only, transform on test preserves 100% of test samples without filtering."""
+    def test_held_out_test_set_isolation(self):
+        """Preprocessing fit on train only, transform on test preserves 100% of test samples without filtering."""
         from sklearn.model_selection import train_test_split
         from retainnet.data import DataPreprocessingPipeline
 
@@ -1243,8 +1254,8 @@ class TestPhase5AScientificValidationSuite(unittest.TestCase):
         # Test features have same column dimension as train
         self.assertEqual(X_test.shape[1], X_train.shape[1])
 
-    def test_change5_stage2_ablation_logic(self):
-        """Change 5: Stage 2 ablation logic compares filtered vs unfiltered on identical test set without failure."""
+    def test_stage2_ablation_logic(self):
+        """Stage 2 ablation logic compares filtered vs unfiltered on identical test set without failure."""
         from retainnet.pipeline import RetainNetHybridPipeline
         from retainnet.metrics import Evaluator
         from retainnet.models import DeepSurvModel

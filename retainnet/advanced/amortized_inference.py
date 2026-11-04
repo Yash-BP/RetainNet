@@ -1,7 +1,12 @@
 import numpy as np
+from typing import Optional, Union
 
-class AmortizedSurvivalInference:
-    """SurvivalPFN-inspired amortized zero-shot survival baseline inference."""
+class ClusterStratifiedKaplanMeier:
+    """
+    Cluster-Stratified Kaplan-Meier Baseline Estimator.
+    Computes non-parametric empirical survival curves stratified by behavioral cluster.
+    Provides fast reference survival priors conditioned on customer cluster membership.
+    """
     def __init__(self, n_clusters: int = 4):
         self.n_clusters = n_clusters
         self.cluster_baselines = {}
@@ -32,7 +37,29 @@ class AmortizedSurvivalInference:
             else:
                 self.cluster_baselines[c] = (unique_times, np.array(surv_c))
 
-    def predict_zero_shot(self, X_new: np.ndarray, cluster_labels_new: np.ndarray, times: np.ndarray) -> np.ndarray:
+    def predict_cluster_prior(
+        self,
+        X_new: Optional[np.ndarray] = None,
+        cluster_labels_new: Optional[np.ndarray] = None,
+        times: Optional[np.ndarray] = None,
+        cluster_id: Optional[int] = None,
+        target_time: Optional[float] = None
+    ) -> Union[np.ndarray, float]:
+        """
+        Predicts cluster-stratified survival prior.
+        Can be called with (X_new, cluster_labels_new, times) for array prediction,
+        or with (cluster_id=c, target_time=t) for scalar prior lookup.
+        """
+        if cluster_id is not None and target_time is not None:
+            if cluster_id in self.cluster_baselines:
+                b_times, b_surv = self.cluster_baselines[cluster_id]
+                right_val = b_surv[-1] if len(b_surv) > 0 else 1.0
+                return float(np.clip(np.interp(target_time, b_times, b_surv, left=1.0, right=right_val), 0.0, 1.0))
+            return 0.5
+
+        if X_new is None or cluster_labels_new is None or times is None:
+            raise ValueError("Must provide either (cluster_id, target_time) or (X_new, cluster_labels_new, times).")
+
         n_samples = len(X_new)
         times_arr = np.asarray(times, dtype=float)
         n_times = len(times_arr)
@@ -50,3 +77,20 @@ class AmortizedSurvivalInference:
                     isd[i] = np.interp(times_arr, b_times, b_surv, left=1.0, right=right_val)
                     
         return np.clip(isd, 0.0, 1.0)
+
+    def predict_survival_curves(self, X_new: np.ndarray, cluster_labels_new: Optional[np.ndarray] = None, times: Optional[np.ndarray] = None) -> np.ndarray:
+        """Convenience method predicting survival curves for new customer feature vectors."""
+        if times is None and isinstance(cluster_labels_new, np.ndarray) and cluster_labels_new.ndim == 1:
+            times = cluster_labels_new
+            cluster_labels_new = np.zeros(len(X_new), dtype=int)
+        elif cluster_labels_new is None:
+            cluster_labels_new = np.zeros(len(X_new), dtype=int)
+        return self.predict_cluster_prior(X_new, cluster_labels_new, times)
+
+    def predict_zero_shot(self, X_new: np.ndarray, cluster_labels_new: np.ndarray, times: np.ndarray) -> np.ndarray:
+        """Backward-compatible alias for predict_cluster_prior."""
+        return self.predict_cluster_prior(X_new, cluster_labels_new, times)
+
+
+# Backward-compatibility alias
+AmortizedSurvivalInference = ClusterStratifiedKaplanMeier

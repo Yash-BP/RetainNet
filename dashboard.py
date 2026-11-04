@@ -11,11 +11,21 @@ _root_dir = os.path.dirname(os.path.abspath(__file__))
 if _root_dir in sys.path:
     sys.path.remove(_root_dir)
 sys.path.insert(0, _root_dir)
+
+# Optimize Windows parallel backend and prevent deprecated wmic timeout
+if "LOKY_MAX_CPU_COUNT" not in os.environ:
+    os.environ["LOKY_MAX_CPU_COUNT"] = str(os.cpu_count() or 4)
+
+import warnings
+warnings.filterwarnings("ignore", message=".*urllib3.*")
+warnings.filterwarnings("ignore", message=".*chardet.*")
+warnings.filterwarnings("ignore", message=".*charset_normalizer.*")
 # -----------------------------------------------------------------------------
 
 import io
 import json
 import math
+import pickle
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -41,6 +51,11 @@ class _StreamlitFallback:
         pass
     def file_uploader(self, *args, **kwargs):
         return None
+    def empty(self, *args, **kwargs):
+        class _EmptyPlaceholder:
+            def markdown(self, *a, **k): pass
+            def empty(self, *a, **k): pass
+        return _EmptyPlaceholder()
 
 
 class _ComponentsFallback:
@@ -71,22 +86,8 @@ try:
 except ImportError:
     st = _StreamlitFallback()
     components = _ComponentsFallback()
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-
-try:
-    from lifelines import KaplanMeierFitter
-    HAS_KM = True
-except ImportError:
-    HAS_KM = False
-
-from retainnet.data import SyntheticSurvivalDataGenerator, DataPreprocessingPipeline, TelcoDatasetLoader
-from retainnet.pipeline import RetainNetHybridPipeline
-from retainnet.models import CoxPHBaselineModel, RandomSurvivalForestBaselineModel, DeepSurvModel, DeepHitModel
-from retainnet.metrics import Evaluator
-from retainnet.ltv import DynamicLTVCalculator
 from retainnet.ltv.calculator import sanitize_csv_cell
-from retainnet.advanced import DriftDetector, ConformalSurvivalCalibrator, AmortizedSurvivalInference
+from retainnet.dashboard.recommendations import classify_customer_retention_tier
 
 MAX_CSV_UPLOAD_BYTES = 25 * 1024 * 1024
 
@@ -111,6 +112,19 @@ STRICT_MONTHLY_CHARGE_KEYS = {
 
 STRICT_CONTRACT_KEYS = {
     "contract", "contract_type", "contracttype",
+}
+
+# Centralized What-If Simulator Policy Assumptions & Sensitivity Multipliers
+SIMULATION_POLICY_CONFIG = {
+    "discount_hazard_slope": 0.015,       # Marginal churn hazard dampening per $1/mo discount
+    "discount_min_factor": 0.65,          # Maximum hazard dampening floor from price reduction
+    "lockin_contract_gamma": 0.60,        # 12-Month Lock-in contract sensitivity multiplier
+    "vip_concierge_gamma": 0.85,          # VIP concierge sensitivity multiplier
+    "vip_concierge_cost": 25.0,           # One-time intervention acquisition/retention cost ($)
+    "disclaimer": (
+        "Simulation projections reflect user-configured sensitivity multipliers (proportional hazard assumptions) "
+        "rather than randomized experimental or causal counterfactual estimates."
+    ),
 }
 
 COLUMN_ALIASES = {
@@ -739,33 +753,34 @@ def validate_and_parse_csv(
     }
 
 
-def _classify_customer_tier(ret12: float) -> Tuple[str, str, str, str, str, str]:
-    if ret12 < 30.0:
-        return (
-            "At-Risk Newbies",
-            "Critical Urgency",
-            "bg-red-100 text-red-800",
-            "Early tenure dropout risk detected! Rapid steepening of hazard rate in early months. Action: Trigger automated $15/mo discount linked to 12-month annual contract lock-in to avert immediate churn.",
-            "λ = 0.088 / mo",
-            "High ROI on Contract Lock-in (+185%)",
-        )
-    if ret12 < 65.0:
-        return (
-            "Price-Sensitive",
-            "Moderate Priority",
-            "bg-amber-100 text-amber-800",
-            "Subscriber shows price sensitivity. Approaching decision boundary. Action: Deploy proactive bundle optimization. Offer $10 bill credit and free speed tier boost.",
-            "λ = 0.035 / mo",
-            "Projected Net Lift: +$140.00",
-        )
-    return (
-        "Loyal Long-Term",
-        "Healthy / Low Risk",
-        "bg-emerald-100 text-emerald-800",
-        "Subscriber displays solid tenure and low hazard rate. Action: Maintain standard VIP loyalty tier. Initiate cross-sell for premium features with zero defensive discounting.",
-        "λ = 0.009 / mo",
-        "Organic Retention (No Discount Needed)",
+def _classify_customer_tier(
+    ret12: float,
+    arpu: float = 65.0,
+    contract_name: str = "Month-to-Month",
+    support_tickets: int = 0
+) -> Tuple[str, str, str, str, str, str]:
+    return classify_customer_retention_tier(
+        ret12=ret12,
+        arpu=arpu,
+        contract_name=contract_name,
+        support_tickets=support_tickets
     )
+
+
+def ensure_models_loaded(trained_bundle: Dict[str, Any]) -> Dict[str, Any]:
+    """Lazily loads heavy trained models (PyTorch, RSF, Cox, Scaler) on demand."""
+    if "dsurv" not in trained_bundle or trained_bundle.get("dsurv") is None:
+        cache_dir = os.path.dirname(os.path.abspath(__file__))
+        models_path = os.path.join(cache_dir, ".models_cache.pkl")
+        if os.path.exists(models_path):
+            try:
+                with open(models_path, "rb") as f:
+                    models_dict = pickle.load(f)
+                if isinstance(models_dict, dict):
+                    trained_bundle.update(models_dict)
+            except Exception:
+                pass
+    return trained_bundle
 
 
 def compute_cohort_payload(
@@ -780,6 +795,7 @@ def compute_cohort_payload(
     Computes synchronized KPIs, survival curves, CLTV distributions, customer profiles (all records),
     Priority Customer Queue, MLOps drift metrics, and CSV export rows for any active dataset.
     """
+    ensure_models_loaded(trained_bundle)
     df_active = df_cohort.copy().reset_index(drop=True)
     if "customer_id" not in df_active.columns:
         prefix = "TELCO" if source_key == "ibm" else ("CUST" if source_key == "weibull" else "CUSTOM")
@@ -825,14 +841,24 @@ def compute_cohort_payload(
         dsurv_mean_curve = trained_bundle["ibm_dsurv_mean_curve"]
         retention_rate_pct = _safe_float(trained_bundle["train_res"].get("retention_rate_pct", 91.7), 91.7)
     elif has_survival_labels:
+        from sklearn.model_selection import train_test_split
+        from retainnet.metrics import Evaluator
+        try:
+            from lifelines import KaplanMeierFitter
+            has_km_pkg = True
+        except ImportError:
+            has_km_pkg = False
+
         T_all = df_active["duration"].values.astype(np.float32)
         E_all = df_active["event"].values.astype(np.int32)
         if len(df_active) >= 20 and len(np.unique(E_all)) > 1:
+            counts = np.bincount(E_all)
+            stratify_target = E_all if (len(counts) >= 2 and np.min(counts) >= 2) else None
             _, idx_eval = train_test_split(
                 np.arange(len(df_active)),
                 test_size=0.2,
                 random_state=42,
-                stratify=E_all,
+                stratify=stratify_target,
             )
         else:
             idx_eval = np.arange(len(df_active))
@@ -852,7 +878,7 @@ def compute_cohort_payload(
             Evaluator.evaluate_model("DeepHit Discrete Engine", dhit_ev, time_grid, T_ev, E_ev, risk_scores=dhit.predict_risk(X_ev)),
             Evaluator.evaluate_model(rsf_label, rsf_ev, time_grid, T_ev, E_ev, risk_scores=rsf.predict_risk(X_ev)),
         ]
-        if HAS_KM and len(T_ev) > 0:
+        if has_km_pkg and len(T_ev) > 0:
             kmf = KaplanMeierFitter()
             kmf.fit(T_ev, event_observed=E_ev)
             km_surv = np.asarray(kmf.survival_function_at_times(time_grid).values, dtype=np.float64).ravel()
@@ -869,6 +895,7 @@ def compute_cohort_payload(
         retention_rate_pct = _safe_float(filt_res.get("retention_rate_pct", 91.7), 91.7)
 
     # Dynamic CLTV across ALL customers in the active dataset
+    from retainnet.ltv import DynamicLTVCalculator
     ltv_calc = DynamicLTVCalculator(default_arpu=65.0, monthly_discount_rate=0.01, acquisition_cost=120.0)
     all_ids = [str(cid) for cid in df_active["customer_id"].values]
     all_charges = (
@@ -945,6 +972,11 @@ def compute_cohort_payload(
     ltv_col = ltv_report["calculated_ltv_$"].values.astype(float)
     ret12_col = ltv_report["12_month_retention_prob_%"].values.astype(float)
     ret24_col = ltv_report["24_month_retention_prob_%"].values.astype(float)
+    support_tickets_col = (
+        df_active["support_tickets"].values.astype(float)
+        if "support_tickets" in df_active.columns
+        else np.zeros(len(df_active), dtype=float)
+    )
 
     for idx in range(len(df_active)):
         cid = all_ids[idx]
@@ -954,12 +986,18 @@ def compute_cohort_payload(
         tenure_months = int(round(_safe_float(durations_col[idx], 24.0)))
         arpu_val = _safe_float(all_charges[idx], 65.0)
         contract_raw = int(contracts_col[idx])
+        st_val = int(round(_safe_float(support_tickets_col[idx], 0.0)))
         if custom_contract_labels is not None and str(custom_contract_labels[idx]).strip() != "":
             contract_name = str(custom_contract_labels[idx]).strip()
         else:
             contract_name = "Two Year" if contract_raw == 2 else ("One Year" if contract_raw == 1 else "Month-to-Month")
 
-        segment, urgency, badge, prescription, hazard, roi_text = _classify_customer_tier(ret12)
+        segment, urgency, badge, prescription, hazard, roi_text = _classify_customer_tier(
+            ret12,
+            arpu=arpu_val,
+            contract_name=contract_name,
+            support_tickets=st_val
+        )
 
         c_dsurv = dsurv_16_all[idx].tolist()
         c_cox = cox_16_all[idx].tolist()
@@ -1024,7 +1062,7 @@ def compute_cohort_payload(
         ])
 
         action_str = "Prescribed VIP Maintenance" if ret12 > 65.0 else "Annual Contract Lock-in"
-        csv_rows.append([cid, f"{c_ltv:.2f}", f"{ret12:.1f}%", f"{ret24:.1f}%", action_str])
+        csv_rows.append([sanitize_csv_cell(cid), f"{c_ltv:.2f}", f"{ret12:.1f}%", f"{ret24:.1f}%", sanitize_csv_cell(action_str)])
 
     default_keys = list(customer_db.keys())
     primary_cid = default_keys[0] if default_keys else "TELCO-0001"
@@ -1090,11 +1128,11 @@ def compute_cohort_payload(
 
     ref_means = trained_bundle["ref_drift_bars"]
     cohort_bars = [
-        float(np.round(np.clip(df_active["monthly_charges"].mean() / 2.3, 5.0, 95.0), 1)),
-        float(np.round(np.clip(durations_col.mean() * 0.9, 5.0, 95.0), 1)),
-        float(np.round(np.clip((contracts_col == 0).mean() * 72.0, 5.0, 95.0), 1)),
-        float(np.round(np.clip(df_active["support_tickets"].mean() * 28.0, 5.0, 95.0), 1)),
-        float(np.round(np.clip(df_active["total_charges"].mean() / 45.0, 5.0, 95.0), 1)),
+        float(np.round(np.clip(df_active["monthly_charges"].mean() / 120.0 * 100.0, 1.0, 100.0), 1)),
+        float(np.round(np.clip(durations_col.mean() / 72.0 * 100.0, 1.0, 100.0), 1)),
+        float(np.round(np.clip((contracts_col == 0).mean() * 100.0, 1.0, 100.0), 1)),
+        float(np.round(np.clip(df_active["support_tickets"].mean() / 10.0 * 100.0, 1.0, 100.0), 1)),
+        float(np.round(np.clip(df_active["total_charges"].mean() / 8000.0 * 100.0, 1.0, 100.0), 1)),
     ]
 
     return {
@@ -1164,8 +1202,33 @@ def _strip_heavy_customer_db_for_json(payload: Dict[str, Any]) -> Dict[str, Any]
     return slim
 
 
-@st.cache_resource(show_spinner="Training RetainNet survival models and initializing Enterprise Intelligence Engine...")
+@st.cache_resource(show_spinner=False)
 def execute_retainnet_pipeline() -> Dict[str, Any]:
+    cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pipeline_cache.pkl")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                cached_res = pickle.load(f)
+            if isinstance(cached_res, dict) and "df_active" in cached_res and "trained_bundle" in cached_res:
+                return cached_res
+        except Exception:
+            pass
+
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import StandardScaler
+    try:
+        from lifelines import KaplanMeierFitter
+        has_km_pkg = True
+    except ImportError:
+        has_km_pkg = False
+
+    from retainnet.data import TelcoDatasetLoader
+    from retainnet.pipeline import RetainNetHybridPipeline
+    from retainnet.models import CoxPHBaselineModel, RandomSurvivalForestBaselineModel, DeepSurvModel, DeepHitModel
+    from retainnet.metrics import Evaluator
+    from retainnet.ltv import DynamicLTVCalculator
+    from retainnet.advanced import DriftDetector, ConformalSurvivalCalibrator, ClusterStratifiedKaplanMeier
+
     df_ibm = TelcoDatasetLoader.load_telco_data(n_samples=2500).copy()
     if "customer_id" not in df_ibm.columns:
         df_ibm["customer_id"] = [f"TELCO-{i + 1:04d}" for i in range(len(df_ibm))]
@@ -1229,7 +1292,7 @@ def execute_retainnet_pipeline() -> Dict[str, Any]:
         Evaluator.evaluate_model(rsf_label, rsf_isd, time_grid, T_test, E_test, risk_scores=rsf_risk),
     ]
 
-    if HAS_KM and len(T_test) > 0:
+    if has_km_pkg and len(T_test) > 0:
         kmf = KaplanMeierFitter()
         kmf.fit(T_test, event_observed=E_test)
         ibm_km_surv = np.asarray(kmf.survival_function_at_times(time_grid).values, dtype=np.float64).ravel()
@@ -1253,7 +1316,7 @@ def execute_retainnet_pipeline() -> Dict[str, Any]:
             covered += 1
     empirical_cov_pct = float(np.round((covered / max(1, n_cov_eval)) * 100.0, 1))
 
-    amortized = AmortizedSurvivalInference(n_clusters=4)
+    amortized = ClusterStratifiedKaplanMeier(n_clusters=4)
     amortized.fit(X_train, T_train, E_train, train_res["cluster_labels"])
 
     drift_det = DriftDetector()
@@ -1261,11 +1324,11 @@ def execute_retainnet_pipeline() -> Dict[str, Any]:
     drift_results = drift_det.detect_drift(X_test)
 
     ref_drift_bars = [
-        float(np.round(np.clip(df_train["monthly_charges"].mean() / 2.3, 5.0, 95.0), 1)),
-        float(np.round(np.clip(df_train["duration"].mean() * 0.9, 5.0, 95.0), 1)),
-        float(np.round(np.clip((df_train["contract_type"] == 0).mean() * 72.0, 5.0, 95.0), 1)),
-        float(np.round(np.clip(df_train["support_tickets"].mean() * 28.0, 5.0, 95.0), 1)),
-        float(np.round(np.clip(df_train["total_charges"].mean() / 45.0, 5.0, 95.0), 1)),
+        float(np.round(np.clip(df_train["monthly_charges"].mean() / 120.0 * 100.0, 1.0, 100.0), 1)),
+        float(np.round(np.clip(df_train["duration"].mean() / 72.0 * 100.0, 1.0, 100.0), 1)),
+        float(np.round(np.clip((df_train["contract_type"] == 0).mean() * 100.0, 1.0, 100.0), 1)),
+        float(np.round(np.clip(df_train["support_tickets"].mean() / 10.0 * 100.0, 1.0, 100.0), 1)),
+        float(np.round(np.clip(df_train["total_charges"].mean() / 8000.0 * 100.0, 1.0, 100.0), 1)),
     ]
 
     trained_bundle = {
@@ -1290,11 +1353,13 @@ def execute_retainnet_pipeline() -> Dict[str, Any]:
         "ref_drift_bars": ref_drift_bars,
     }
 
+    is_real_telco = getattr(df_ibm, "attrs", {}).get("is_real", False)
+    ibm_source_label = "IBM Telco Dataset (Loaded CSV)" if is_real_telco else "Synthetic Telco Benchmark Cohort"
     ibm_payload = compute_cohort_payload(
         df_ibm,
         trained_bundle,
         source_key="ibm",
-        source_label="IBM Telco Benchmark",
+        source_label=ibm_source_label,
         is_inference_only=False,
         is_synthetic_demo=False,
     )
@@ -1369,6 +1434,7 @@ def execute_retainnet_pipeline() -> Dict[str, Any]:
         "dsurv_mlp": dsurv_mlp_layers,
         "cox_params": cox_params_list,
         "amortized_12m_priors": amortized_12m_priors,
+        "sim_policy": SIMULATION_POLICY_CONFIG,
     }
 
     df_train_viz = df_train.copy()
@@ -1376,7 +1442,7 @@ def execute_retainnet_pipeline() -> Dict[str, Any]:
     keep_mask = np.asarray(test_res["keep_mask"], dtype=bool)
     filtered_ids = list(df_test["customer_id"].values[keep_mask])
 
-    return {
+    pipeline_res = {
         "df_active": df_ibm,
         "df_weibull": df_weibull,
         "df_train_viz": df_train_viz,
@@ -1403,6 +1469,40 @@ def execute_retainnet_pipeline() -> Dict[str, Any]:
         "weibull_payload": weibull_payload,
         "model_bundle_js": model_bundle_js,
     }
+    try:
+        # 1. Save heavyweight models separately for lazy on-demand retrieval
+        model_keys = ["scaler", "hybrid", "cox", "rsf", "dsurv", "dhit", "drift_det", "calibrator", "amortized"]
+        models_bundle = {
+            k: trained_bundle[k] for k in model_keys
+            if k in trained_bundle
+        }
+        models_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".models_cache.pkl")
+        with open(models_path, "wb") as f:
+            pickle.dump(models_bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        # 2. Save slim pipeline cache for sub-second startup
+        slim_trained = {
+            k: v for k, v in trained_bundle.items()
+            if k not in model_keys
+        }
+        p_cid = ibm_payload.get("primary_cid")
+        slim_ibm = dict(ibm_payload)
+        slim_ibm["customer_db"] = {p_cid: ibm_payload["customer_db"][p_cid]} if p_cid and p_cid in ibm_payload.get("customer_db", {}) else {}
+
+        w_cid = weibull_payload.get("primary_cid")
+        slim_weibull = dict(weibull_payload)
+        slim_weibull["customer_db"] = {w_cid: weibull_payload["customer_db"][w_cid]} if w_cid and w_cid in weibull_payload.get("customer_db", {}) else {}
+
+        slim_pipeline_res = dict(pipeline_res)
+        slim_pipeline_res["trained_bundle"] = slim_trained
+        slim_pipeline_res["ibm_payload"] = slim_ibm
+        slim_pipeline_res["weibull_payload"] = slim_weibull
+
+        with open(cache_path, "wb") as f:
+            pickle.dump(slim_pipeline_res, f, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass
+    return pipeline_res
 
 
 def generate_synthetic_weibull_cohort(n_samples: int = 2500, seed: int = 42) -> pd.DataFrame:
@@ -1411,6 +1511,7 @@ def generate_synthetic_weibull_cohort(n_samples: int = 2500, seed: int = 42) -> 
     and aligns optional Telco feature columns for unified pipeline evaluation.
     """
     n_clamped = max(1, min(20000, int(n_samples)))
+    from retainnet.data import SyntheticSurvivalDataGenerator
     gen = SyntheticSurvivalDataGenerator(seed=int(seed))
     df_syn = gen.generate(n_samples=n_clamped).copy()
     if "support_tickets" not in df_syn.columns and "support_calls" in df_syn.columns:
@@ -1479,8 +1580,9 @@ def get_active_dashboard_payload(pipeline_output: Optional[Dict[str, Any]] = Non
     st.session_state["active_data_source"] = st.session_state.get("active_source", "ibm")
     # Synchronize selected subscriber ID if stale
     sel_id = st.session_state.get("selected_subscriber_id")
-    if sel_id not in payload["customer_db"]:
-        st.session_state["selected_subscriber_id"] = payload["primary_cid"]
+    valid_cids = payload.get("customer_ids") or payload.get("customer_db", {})
+    if sel_id not in valid_cids:
+        st.session_state["selected_subscriber_id"] = payload.get("primary_cid", "")
 
     return payload
 
@@ -1603,6 +1705,13 @@ def search_subscribers(
     Supports case-insensitive partial matching and returns matching subscriber records.
     """
     customer_db = payload_or_db.get("customer_db", payload_or_db)
+    if not customer_db and isinstance(payload_or_db, dict) and "compact_customers" in payload_or_db:
+        customer_db = {}
+        for r in payload_or_db["compact_customers"]:
+            customer_db[r[0]] = {
+                "cid": r[0], "ltv": r[1], "ret12": r[2], "segment": r[3],
+                "urgency": r[4], "contract": r[5], "monthly_charges": r[6], "tickets": r[7]
+            }
     q = str(query or "").strip().lower()
     if not q:
         return list(customer_db.values())
@@ -1640,7 +1749,9 @@ st.markdown("""
         background-color: #F5F4ED !important;
     }
 
-    div[data-testid="stCustomComponentV1"], div[data-testid="element-container"] {
+    div[data-testid="stCustomComponentV1"],
+    div[data-testid="element-container"]:has(iframe),
+    div.element-container:has(iframe) {
         width: 100vw !important;
         height: 100vh !important;
         max-height: 100vh !important;
@@ -1664,8 +1775,149 @@ st.markdown("""
         left: 0 !important;
         background-color: #F5F4ED !important;
     }
+
+    /* Elegant Centered Loading Splash Screen */
+    .retainnet-splash-overlay {
+        position: fixed !important;
+        top: 0 !important;
+        left: 0 !important;
+        width: 100vw !important;
+        height: 100vh !important;
+        background-color: #F5F4ED !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        z-index: 9999999 !important;
+        font-family: 'Plus Jakarta Sans', Inter, -apple-system, sans-serif !important;
+    }
+    .retainnet-splash-card {
+        background: #FFFFFF !important;
+        border: 1px solid rgba(226, 223, 200, 0.9) !important;
+        border-radius: 36px !important;
+        padding: 2.75rem 2.5rem !important;
+        box-shadow: 0 24px 50px -12px rgba(24, 30, 25, 0.12), 0 4px 16px rgba(0, 0, 0, 0.04) !important;
+        display: flex !important;
+        flex-direction: column !important;
+        align-items: center !important;
+        justify-content: center !important;
+        text-align: center !important;
+        width: 90% !important;
+        max-width: 320px !important;
+        box-sizing: border-box !important;
+        animation: retainnetFadeIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards !important;
+    }
+    .retainnet-splash-card > * {
+        margin-left: auto !important;
+        margin-right: auto !important;
+        box-sizing: border-box !important;
+    }
+    .retainnet-logo-wrap {
+        position: relative !important;
+        width: 84px !important;
+        height: 84px !important;
+        margin: 0 auto !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+    }
+    .retainnet-logo-badge {
+        width: 84px !important;
+        height: 84px !important;
+        border-radius: 26px !important;
+        background-color: #121614 !important;
+        color: #FFFFFF !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        font-size: 2.1rem !important;
+        font-weight: 900 !important;
+        letter-spacing: -0.03em !important;
+        line-height: 1 !important;
+        position: relative !important;
+        z-index: 2 !important;
+        box-shadow: 0 12px 28px -4px rgba(0, 0, 0, 0.36), 0 4px 10px rgba(0, 0, 0, 0.15) !important;
+    }
+    .retainnet-pulse-glow {
+        position: absolute !important;
+        top: -6px !important;
+        left: -6px !important;
+        right: -6px !important;
+        bottom: -6px !important;
+        border-radius: 32px !important;
+        background: rgba(18, 22, 20, 0.14) !important;
+        z-index: 1 !important;
+        animation: retainnetPulse 2.2s cubic-bezier(0.4, 0, 0.6, 1) infinite !important;
+    }
+    .retainnet-brand-title {
+        font-size: 1.85rem !important;
+        font-weight: 800 !important;
+        color: #121614 !important;
+        margin: 1.15rem auto 0 auto !important;
+        letter-spacing: -0.03em !important;
+        line-height: 1.1 !important;
+        text-align: center !important;
+        width: 100% !important;
+        display: block !important;
+    }
+    .retainnet-brand-sub {
+        font-size: 0.65rem !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.22em !important;
+        text-transform: uppercase !important;
+        color: #8C9488 !important;
+        margin: 0.45rem auto 0 auto !important;
+        display: block !important;
+        text-align: center !important;
+        width: 100% !important;
+        padding-left: 0.22em !important;
+    }
+    .retainnet-splash-card pre, .retainnet-splash-card code {
+        display: none !important;
+    }
+
+    /* Fallback defense: center any native Streamlit alert or spinner */
+    div[data-testid="stAlert"], .stSpinner, [data-testid="stNotification"] {
+        position: fixed !important;
+        top: 50% !important;
+        left: 50% !important;
+        transform: translate(-50%, -50%) !important;
+        z-index: 10000000 !important;
+        background-color: #FFFFFF !important;
+        color: #181E19 !important;
+        border: 1px solid #E2DFC8 !important;
+        border-radius: 1.25rem !important;
+        box-shadow: 0 16px 40px rgba(24, 30, 25, 0.08) !important;
+        padding: 1.25rem 2rem !important;
+        font-family: 'Plus Jakarta Sans', sans-serif !important;
+        text-align: center !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        gap: 0.75rem !important;
+    }
+
+    @keyframes retainnetFadeIn {
+        from { opacity: 0; transform: scale(0.96) translateY(10px); }
+        to { opacity: 1; transform: scale(1) translateY(0); }
+    }
+    @keyframes retainnetPulse {
+        0%, 100% { transform: scale(1); opacity: 0.35; }
+        50% { transform: scale(1.14); opacity: 0.75; }
+    }
 </style>
 """, unsafe_allow_html=True)
+
+splash_placeholder = st.empty()
+splash_placeholder.markdown("""<div class="retainnet-splash-overlay">
+<div class="retainnet-splash-card">
+<div class="retainnet-logo-wrap">
+<div class="retainnet-logo-badge">RN</div>
+<div class="retainnet-pulse-glow"></div>
+</div>
+<div class="retainnet-brand-title">RetainNet</div>
+<div class="retainnet-brand-sub">ENTERPRISE INTELLIGENCE</div>
+</div>
+</div>""", unsafe_allow_html=True)
 
 # Execute pipeline & initialize state
 pipeline_output = execute_retainnet_pipeline()
@@ -1687,19 +1939,50 @@ embedded_payload["model_bundle"] = pipeline_output["model_bundle_js"]
 embedded_payload["csv_template"] = CSV_TEMPLATE_CONTENT = CSV_TEMPLATE_STRING
 embedded_payload["max_csv_bytes"] = MAX_CSV_UPLOAD_BYTES
 
-app_data_json = json.dumps(embedded_payload, allow_nan=False)
+def _sanitize_for_json(obj: Any) -> Any:
+    if isinstance(obj, (float, np.floating)):
+        if math.isnan(obj) or math.isinf(obj):
+            return 0.0
+        return float(obj)
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return _sanitize_for_json(obj.tolist())
+    return obj
+
+app_data_json = json.dumps(_sanitize_for_json(embedded_payload), allow_nan=False)
 
 html_template = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net https://fonts.googleapis.com https://fonts.gstatic.com data: blob:;" />
   <title>RetainNet Enterprise Churn & CLTV Intelligence System</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400&display=swap" rel="stylesheet">
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    if (window.Chart) {{
+      Chart.defaults.font.family = '"Plus Jakarta Sans", Inter, -apple-system, sans-serif';
+      Chart.defaults.color = '#6A7265';
+      if (Chart.defaults.plugins && Chart.defaults.plugins.tooltip) {{
+        Chart.defaults.plugins.tooltip.backgroundColor = '#121614';
+        Chart.defaults.plugins.tooltip.titleColor = '#F5F4ED';
+        Chart.defaults.plugins.tooltip.bodyColor = '#D1CFBF';
+        Chart.defaults.plugins.tooltip.borderColor = 'rgba(255, 255, 255, 0.12)';
+        Chart.defaults.plugins.tooltip.borderWidth = 1;
+        Chart.defaults.plugins.tooltip.padding = 10;
+        Chart.defaults.plugins.tooltip.cornerRadius = 8;
+        Chart.defaults.plugins.tooltip.boxPadding = 4;
+        Chart.defaults.plugins.tooltip.usePointStyle = true;
+      }}
+    }}
+  </script>
   <script>
     tailwind.config = {{
       theme: {{
@@ -1761,19 +2044,151 @@ html_template = f"""<!DOCTYPE html>
 
     .kpi-card {{
       background-color: #ffffff;
-      border: 1px solid #E6E4D9;
+      border: 1px solid rgba(226, 223, 200, 0.85);
       border-radius: 1rem;
       padding: 1.25rem 1.35rem;
       display: flex;
       flex-direction: column;
       justify-content: space-between;
-      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02), 0 2px 6px rgba(0,0,0,0.015);
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02), 0 6px 18px -4px rgba(24, 30, 25, 0.04);
       min-height: 112px;
       overflow: visible;
-      transition: transform 0.15s ease, box-shadow 0.15s ease;
+      transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.2s ease;
     }}
     .kpi-card:hover {{
-      box-shadow: 0 4px 12px rgba(24, 30, 25, 0.05);
+      transform: translateY(-2px);
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.03), 0 12px 24px -4px rgba(24, 30, 25, 0.08);
+      border-color: #D4D1BE;
+    }}
+
+    @keyframes fadeInTab {{
+      from {{
+        opacity: 0;
+        transform: translateY(4px);
+      }}
+      to {{
+        opacity: 1;
+        transform: translateY(0);
+      }}
+    }}
+    .tab-content-active {{
+      animation: fadeInTab 0.18s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }}
+
+    input[type="range"] {{
+      -webkit-appearance: none;
+      appearance: none;
+      width: 100%;
+      height: 6px;
+      background: #D9D7C7;
+      border-radius: 9999px;
+      outline: none;
+      transition: background 0.2s ease;
+    }}
+    input[type="range"]::-webkit-slider-thumb {{
+      -webkit-appearance: none;
+      appearance: none;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: #3B5740;
+      border: 2.5px solid #FFFFFF;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.22);
+      cursor: pointer;
+      transition: transform 0.15s ease, background-color 0.15s ease;
+    }}
+    input[type="range"]::-webkit-slider-thumb:hover {{
+      transform: scale(1.15);
+      background: #2E4432;
+    }}
+    input[type="range"]::-moz-range-thumb {{
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: #3B5740;
+      border: 2.5px solid #FFFFFF;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.22);
+      cursor: pointer;
+      transition: transform 0.15s ease;
+    }}
+
+    table tbody tr {{
+      transition: background-color 0.15s ease;
+    }}
+    table tbody tr:hover {{
+      background-color: #FAF9F3 !important;
+    }}
+
+    .font-tabular {{
+      font-variant-numeric: tabular-nums !important;
+      font-feature-settings: "tnum" 1 !important;
+    }}
+
+    button, input[type="range"], select {{
+      transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+    }}
+
+    .metric-info-badge {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 14px;
+      height: 14px;
+      border-radius: 9999px;
+      background-color: #E6E4D9;
+      color: #6C7567;
+      font-size: 9px;
+      font-weight: 700;
+      cursor: help;
+      margin-left: 4px;
+      position: relative;
+      transition: background-color 0.15s ease, color 0.15s ease, transform 0.15s ease;
+      vertical-align: middle;
+      line-height: 1;
+      text-transform: none;
+    }}
+    .metric-info-badge:hover {{
+      background-color: #3B5740;
+      color: #FFFFFF;
+      transform: scale(1.1);
+    }}
+    .metric-tooltip {{
+      visibility: hidden;
+      opacity: 0;
+      position: absolute;
+      bottom: calc(100% + 6px);
+      left: 50%;
+      transform: translateX(-50%) translateY(4px);
+      background-color: #181E19;
+      color: #F5F4ED;
+      font-size: 11px;
+      font-weight: 400;
+      line-height: 1.4;
+      padding: 6px 10px;
+      border-radius: 6px;
+      white-space: normal;
+      width: 210px;
+      max-width: 250px;
+      z-index: 100;
+      pointer-events: none;
+      transition: opacity 0.18s cubic-bezier(0.16, 1, 0.3, 1), transform 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+      box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+      text-align: left;
+    }}
+    .metric-tooltip::after {{
+      content: '';
+      position: absolute;
+      top: 100%;
+      left: 50%;
+      margin-left: -4px;
+      border-width: 4px;
+      border-style: solid;
+      border-color: #181E19 transparent transparent transparent;
+    }}
+    .metric-info-badge:hover .metric-tooltip {{
+      visibility: visible;
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
     }}
 
     .kpi-label {{
@@ -1792,6 +2207,9 @@ html_template = f"""<!DOCTYPE html>
       font-weight: 800;
       color: #181E19;
       line-height: 1.15;
+      font-variant-numeric: tabular-nums;
+      font-feature-settings: "tnum" 1;
+      letter-spacing: -0.02em;
     }}
 
     .kpi-sub {{
@@ -1826,14 +2244,19 @@ html_template = f"""<!DOCTYPE html>
       transform: translateY(0);
     }}
 
+    .nav-link {{
+      transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1) !important;
+      border-left: 3px solid transparent !important;
+    }}
     .nav-link.active {{
-      background-color: #181E19;
-      color: #FFFFFF;
-      font-weight: 600;
-      box-shadow: 0 2px 5px rgba(24, 30, 25, 0.25);
+      background-color: #181E19 !important;
+      color: #FFFFFF !important;
+      font-weight: 600 !important;
+      box-shadow: 0 2px 8px rgba(24, 30, 25, 0.25) !important;
+      border-left: 3px solid #3B5740 !important;
     }}
     .nav-link.active svg {{
-      stroke: #FFFFFF;
+      stroke: #FFFFFF !important;
     }}
 
     .hidden {{
@@ -1981,12 +2404,12 @@ html_template = f"""<!DOCTYPE html>
     <div class="p-5">
       <!-- Brand Header -->
       <div class="flex items-center gap-3 mb-6">
-        <div class="w-10 h-10 rounded-xl bg-[#181E19] flex items-center justify-center text-white font-bold text-sm tracking-wide shadow-sm">
+        <div class="w-11 h-11 rounded-2xl bg-[#121614] flex items-center justify-center text-white font-black text-base tracking-tighter shadow-md border border-white/5">
           RN
         </div>
         <div>
-          <h1 class="text-base font-bold text-branddark tracking-tight leading-none">RetainNet</h1>
-          <span class="text-[10px] font-medium text-subtle tracking-wider uppercase">Enterprise Intelligence</span>
+          <h1 class="text-base font-extrabold text-[#121614] tracking-tight leading-none">RetainNet</h1>
+          <span class="text-[9px] font-bold text-[#8C9488] tracking-[0.20em] uppercase block mt-1">Enterprise Intelligence</span>
         </div>
       </div>
 
@@ -2018,7 +2441,7 @@ html_template = f"""<!DOCTYPE html>
 
         <button onclick="switchTab('customers')" id="tab-btn-customers" class="nav-link w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-medium text-charcoal hover:bg-[#E2E0D4] transition">
           <svg class="w-4 h-4 stroke-current" fill="none" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
-          <span>3. Customer Prescriptions</span>
+          <span>3. Customer Retention</span>
         </button>
 
         <button onclick="switchTab('simulator')" id="tab-btn-simulator" class="nav-link w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-medium text-charcoal hover:bg-[#E2E0D4] transition">
@@ -2045,7 +2468,7 @@ html_template = f"""<!DOCTYPE html>
         <div class="space-y-2">
           <label for="dataset-selector" class="text-[11px] font-semibold text-charcoal block mb-1">Data Source</label>
           <select id="dataset-selector" onchange="handleDatasetChange(this.value)" class="w-full bg-cardbg border border-[#D9D7C7] rounded-lg px-2.5 py-1.5 text-xs text-charcoal focus:outline-none focus:border-forest transition">
-            <option value="ibm" id="opt-ibm" selected>IBM Telco Benchmark ({app_data['kpi']['subscribers']})</option>
+            <option value="ibm" id="opt-ibm" selected>{app_data['source_label']} ({app_data['kpi']['subscribers']})</option>
             <option value="weibull" id="opt-weibull">Synthetic Weibull Cohort (2,500)</option>
             <option value="custom" id="opt-custom">Upload Custom CSV</option>
           </select>
@@ -2163,7 +2586,7 @@ html_template = f"""<!DOCTYPE html>
     <!-- Live Workspace Status Card -->
     <div class="p-4 m-3 bg-[#E4E2D8] border border-[#D6D4C5] rounded-xl text-xs">
       <div class="text-[10px] font-bold text-subtle uppercase tracking-wider mb-1">Live Backend Status</div>
-      <p id="sidebar-status-text" class="text-[11px] text-charcoal leading-snug mb-3">Active source: IBM Telco Benchmark ({app_data['kpi']['subscribers']} customer profiles).</p>
+      <p id="sidebar-status-text" class="text-[11px] text-charcoal leading-snug mb-3">Active source: {app_data['source_label']} ({app_data['kpi']['subscribers']} customer profiles).</p>
       <div class="flex items-center gap-2 bg-white/80 py-1.5 px-2.5 rounded-lg border border-[#D5D3C4]">
         <span class="w-2 h-2 rounded-full bg-emerald-600 animate-ping"></span>
         <span id="sidebar-status-pill" class="text-[10px] font-bold text-emerald-800">Pipeline Operational</span>
@@ -2180,7 +2603,7 @@ html_template = f"""<!DOCTYPE html>
           <span>RetainNet System</span>
           <span>/</span>
           <span id="breadcrumb-title" class="text-charcoal font-semibold">Executive Summary</span>
-          <span id="active-source-badge" class="ml-2 px-2 py-0.5 rounded-full text-[10px] font-bold bg-[#EAF1EC] text-forest">IBM Telco Benchmark</span>
+          <span id="active-source-badge" class="ml-2 px-2 py-0.5 rounded-full text-[10px] font-bold bg-[#EAF1EC] text-forest">{app_data['source_label']}</span>
         </div>
         <h2 id="page-heading" class="text-xl font-extrabold text-branddark tracking-tight">Portfolio Health & Dynamic CLTV</h2>
       </div>
@@ -2295,10 +2718,10 @@ html_template = f"""<!DOCTYPE html>
                 <tr>
                   <th class="py-3 px-5">Customer ID</th>
                   <th class="py-3 px-5">Segment</th>
-                  <th class="py-3 px-5">Monthly Fee</th>
-                  <th class="py-3 px-5">Dynamic LTV</th>
-                  <th class="py-3 px-5">12M Survival</th>
-                  <th class="py-3 px-5">Risk Status</th>
+                  <th class="py-3 px-5 text-right">Monthly Fee</th>
+                  <th class="py-3 px-5 text-right">Dynamic LTV</th>
+                  <th class="py-3 px-5 text-right">12M Survival</th>
+                  <th class="py-3 px-5 text-center">Risk Status</th>
                   <th class="py-3 px-5 text-right">Action</th>
                 </tr>
               </thead>
@@ -2322,7 +2745,7 @@ html_template = f"""<!DOCTYPE html>
             <div class="kpi-sub">Optimizing Cox partial log-likelihood</div>
           </div>
           <div class="kpi-card">
-            <span class="kpi-label">Harrell's C-Index</span>
+            <span class="kpi-label">Harrell's C-Index <span class="metric-info-badge">?<span class="metric-tooltip">Concordance Index: evaluates rank-order accuracy of risk predictions (0.5 = random, 1.0 = perfect ranking).</span></span></span>
             <div class="kpi-value" id="pipe-cindex">{app_data['kpi']['best_cindex']}</div>
             <div class="kpi-sub"><span class="text-forest font-semibold">Rank-order concordance</span></div>
           </div>
@@ -2335,8 +2758,8 @@ html_template = f"""<!DOCTYPE html>
 
         <div class="bg-white p-6 rounded-2xl border border-lineborder shadow-2xs">
           <div class="mb-5">
-            <h3 class="font-bold text-branddark text-base">RetainNet 3-Stage Denoising Funnel Architecture</h3>
-            <p class="text-xs text-subtle">How RetainNet filters label noise in churn right-censoring before non-linear hazard learning</p>
+            <h3 class="font-bold text-branddark text-base">RetainNet 3-Stage Segmentation & Survival Architecture</h3>
+            <p class="text-xs text-subtle">How RetainNet structures customer segmentation, boundary analysis, and non-linear hazard learning</p>
           </div>
 
           <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -2353,7 +2776,7 @@ html_template = f"""<!DOCTYPE html>
 
             <div class="bg-[#FAF9F3] p-5 rounded-xl border border-lineborder">
               <div class="text-[10px] font-extrabold uppercase px-2 py-0.5 rounded bg-ambercustom text-white inline-block mb-2">Stage 2</div>
-              <h4 class="font-bold text-sm text-branddark mb-1">Propensity Denoising</h4>
+              <h4 class="font-bold text-sm text-branddark mb-1">Propensity Boundary Analysis</h4>
               <p class="text-xs text-subtle leading-relaxed mb-3">
                 Boundary excision removes ambiguous churn records (<span class="font-mono text-branddark font-semibold">0.30 ≤ p̂ ≤ 0.70</span>), retaining high confidence signal.
               </p>
@@ -2385,12 +2808,12 @@ html_template = f"""<!DOCTYPE html>
               <thead class="bg-[#FAF9F3] text-subtle font-bold border-b border-lineborder">
                 <tr>
                   <th class="py-3 px-5">Model Architecture</th>
-                  <th class="py-3 px-5">Harrell's C-Index (↑)</th>
-                  <th class="py-3 px-5">Integrated Brier Score (↓)</th>
-                  <th class="py-3 px-5">BS @ 12M</th>
-                  <th class="py-3 px-5">BS @ 24M</th>
-                  <th class="py-3 px-5">BS @ 36M</th>
-                  <th class="py-3 px-5">D-Calibration χ²</th>
+                  <th class="py-3 px-5 text-right">Harrell's C-Index (↑) <span class="metric-info-badge">?<span class="metric-tooltip">Harrell's C-Index evaluates rank-order accuracy of survival predictions. Higher is better.</span></span></th>
+                  <th class="py-3 px-5 text-right">Integrated Brier Score (↓) <span class="metric-info-badge">?<span class="metric-tooltip">Integrated Brier Score (IBS) measures mean squared calibration error across time. Lower is better.</span></span></th>
+                  <th class="py-3 px-5 text-right">BS @ 12M</th>
+                  <th class="py-3 px-5 text-right">BS @ 24M</th>
+                  <th class="py-3 px-5 text-right">BS @ 36M</th>
+                  <th class="py-3 px-5 text-center">D-Calibration χ² <span class="metric-info-badge">?<span class="metric-tooltip">Distributional Calibration test assesses whether survival probability quantiles are uniformly distributed across bins.</span></span></th>
                 </tr>
               </thead>
               <tbody id="leaderboard-body" class="divide-y divide-lineborder text-charcoal">
@@ -2416,7 +2839,7 @@ html_template = f"""<!DOCTYPE html>
         </div>
       </section>
 
-      <!-- TAB 3: CUSTOMER LOOKUP & CLINICAL PRESCRIPTIONS -->
+      <!-- TAB 3: CUSTOMER LOOKUP & RETENTION PRESCRIPTIONS -->
       <section id="tab-customers" class="tab-panel hidden space-y-6">
         <div class="bg-white p-5 rounded-2xl border border-lineborder shadow-2xs flex flex-wrap items-center justify-between gap-4">
           <div class="flex flex-wrap items-center gap-3 flex-1 min-w-[280px]">
@@ -2456,11 +2879,18 @@ html_template = f"""<!DOCTYPE html>
             <div>
               <div class="flex items-center gap-2">
                 <h3 class="font-bold text-branddark text-base" id="c-curve-title">Individualized Survival Function S(t | x)</h3>
-                <span class="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full">CiPOT 90% Conformal Bounds</span>
+                <span class="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full inline-flex items-center">
+                  Empirical 90% Survival Bounds
+                  <span class="metric-info-badge">?<span class="metric-tooltip">Empirical non-parametric uncertainty quantiles computed across holdout validation curves to guarantee 90% coverage.</span></span>
+                </span>
               </div>
-              <p class="text-xs text-subtle">Uncertainty envelope showing distribution-free 90% coverage guarantees</p>
+              <p class="text-xs text-subtle">Censoring-aware empirical uncertainty intervals calibrated on held-out observations</p>
             </div>
             <div class="flex items-center gap-3 text-xs">
+              <button id="btn-toggle-compare-models" onclick="toggleCompareModels()" class="px-2.5 py-1 rounded-lg border border-[#D9D7C7] bg-[#FAF9F3] hover:bg-[#EAE8D9] text-charcoal font-semibold text-[11px] transition flex items-center gap-1.5 cursor-pointer shadow-2xs">
+                <span id="compare-indicator" class="w-2 h-2 rounded-full bg-subtle"></span>
+                <span>Compare All Models</span>
+              </button>
               <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-forest"></span> Point Estimate</span>
               <span class="flex items-center gap-1.5"><span class="w-3 h-2 bg-emerald-200/50 rounded-2xs"></span> 90% Conformal Band</span>
             </div>
@@ -2472,8 +2902,8 @@ html_template = f"""<!DOCTYPE html>
 
         <div class="bg-[#FCFBF8] border-2 border-[#E2DFC8] p-6 rounded-2xl shadow-2xs">
           <div class="flex items-start gap-4">
-            <div class="w-10 h-10 rounded-xl bg-forest text-white flex items-center justify-center shrink-0 text-lg font-bold">
-              ⚕
+            <div class="w-10 h-10 rounded-xl bg-forest text-white flex items-center justify-center shrink-0 shadow-sm border border-forest/20">
+              <svg class="w-5 h-5 text-white stroke-current" fill="none" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
             </div>
             <div class="space-y-3 flex-1">
               <div class="flex items-center justify-between">
@@ -2489,16 +2919,24 @@ html_template = f"""<!DOCTYPE html>
               <div class="grid grid-cols-1 md:grid-cols-3 gap-3 pt-2 text-xs">
                 <div class="p-3 bg-white rounded-xl border border-lineborder">
                   <span class="text-subtle font-medium block">Current Hazard Rate</span>
-                  <span id="c-hazard" class="font-bold text-sm text-branddark">-</span>
+                  <span id="c-hazard" class="font-bold text-sm text-branddark font-tabular">-</span>
                 </div>
                 <div class="p-3 bg-white rounded-xl border border-lineborder">
                   <span class="text-subtle font-medium block">Projected Dynamic LTV</span>
-                  <span id="c-ltv-calc" class="font-bold text-sm text-forest">-</span>
+                  <span id="c-ltv-calc" class="font-bold text-sm text-forest font-tabular">-</span>
                 </div>
                 <div class="p-3 bg-white rounded-xl border border-lineborder">
                   <span class="text-subtle font-medium block">Intervention ROI</span>
-                  <span id="c-intervention-roi" class="font-bold text-sm text-charcoal">-</span>
+                  <span id="c-intervention-roi" class="font-bold text-sm text-charcoal font-tabular">-</span>
                 </div>
+              </div>
+
+              <div class="pt-2 flex flex-wrap items-center justify-between gap-2">
+                <button type="button" onclick="simulateCustomer(currentCustId)" class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-forest hover:bg-forest-hover text-white text-xs font-semibold shadow-2xs transition cursor-pointer">
+                  <span>Simulate in What-If Engine</span>
+                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"/></svg>
+                </button>
+                <span class="text-[10px] text-subtle italic">Pre-loads subscriber curve into scenario simulator</span>
               </div>
             </div>
           </div>
@@ -2512,7 +2950,7 @@ html_template = f"""<!DOCTYPE html>
             <div class="flex items-start justify-between gap-2">
               <div>
                 <h3 class="font-bold text-branddark text-base">Intervention Parameters</h3>
-                <p class="text-xs text-subtle">Counterfactual simulation linked to active subscriber &amp; global financial settings</p>
+                <p class="text-xs text-subtle">Scenario-planning tool based on proportional-hazard assumptions, not a randomized causal uplift model</p>
               </div>
               <button type="button" onclick="resetSimulation()" class="px-2.5 py-1 rounded-lg bg-[#ECEBE3] hover:bg-[#E2E0D4] text-[11px] font-bold text-charcoal shrink-0 transition">
                 Reset
@@ -2563,6 +3001,7 @@ html_template = f"""<!DOCTYPE html>
                 <span id="sim-gamma-val" class="text-2xl font-black text-forest">0.465</span>
                 <span id="sim-gamma-reduction" class="text-[11px] text-forest font-semibold">-53.5% Churn Risk</span>
               </div>
+              <p class="text-[10px] text-forest/80 mt-1 italic leading-tight">Policy sensitivity multiplier (proportional hazard scaling); not an experimental causal estimate.</p>
             </div>
           </div>
 
@@ -2613,17 +3052,17 @@ html_template = f"""<!DOCTYPE html>
       <section id="tab-mlops" class="tab-panel hidden space-y-6">
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div class="kpi-card">
-            <span class="kpi-label">Population Stability Index (PSI)</span>
+            <span class="kpi-label">Population Stability Index (PSI) <span class="metric-info-badge">?<span class="metric-tooltip">Population Stability Index (PSI): quantifies feature distribution shift (&lt;0.10 stable, &ge;0.20 significant drift).</span></span></span>
             <div class="kpi-value text-forest" id="mlops-psi">{app_data['mlops']['psi']}</div>
             <div class="kpi-sub"><span class="text-emerald-700 font-semibold" id="mlops-psi-sub">Green: &lt; 0.20 (Stable)</span></div>
           </div>
           <div class="kpi-card">
-            <span class="kpi-label">Kolmogorov-Smirnov (KS) Test</span>
+            <span class="kpi-label">Kolmogorov-Smirnov (KS) Test <span class="metric-info-badge">?<span class="metric-tooltip">Two-sample Kolmogorov-Smirnov test: assesses whether reference and evaluation feature empirical distributions differ significantly.</span></span></span>
             <div class="kpi-value" id="mlops-ks">{app_data['mlops']['ks_stat']}</div>
             <div class="kpi-sub" id="mlops-ks-sub">p = {app_data['mlops'].get('ks_pval', '0.420')} (Ref N={app_data['mlops'].get('ref_n', 2000):,} vs Eval N={app_data['mlops'].get('eval_n', 2500):,})</div>
           </div>
           <div class="kpi-card">
-            <span class="kpi-label">Conformal Coverage @ 90%</span>
+            <span class="kpi-label">Conformal Coverage @ 90% <span class="metric-info-badge">?<span class="metric-tooltip">Empirical fraction of ground-truth survival observations falling within calibrated 90% conformal intervals.</span></span></span>
             <div class="kpi-value text-forest" id="mlops-coverage">{app_data['mlops']['coverage']}</div>
             <div class="kpi-sub">Well-calibrated non-parametric band</div>
           </div>
@@ -2646,10 +3085,10 @@ html_template = f"""<!DOCTYPE html>
           <div class="lg:col-span-5 bg-white p-6 rounded-2xl border border-lineborder shadow-2xs flex flex-col justify-between">
             <div>
               <div class="flex items-center gap-2 mb-1">
-                <h3 class="font-bold text-branddark text-base">SurvivalPFN Cold-Start Engine</h3>
-                <span class="px-2 py-0.5 rounded text-[10px] font-extrabold bg-ambercustom text-white">ZERO-SHOT</span>
+                <h3 class="font-bold text-branddark text-base">Cluster-Based Kaplan–Meier Baseline</h3>
+                <span class="px-2 py-0.5 rounded text-[10px] font-extrabold bg-ambercustom text-white">NON-PARAMETRIC</span>
               </div>
-              <p class="text-xs text-subtle mb-4">Instantly infer survival curve for fresh signups without historical activity</p>
+              <p class="text-xs text-subtle mb-4">Stratified Kaplan–Meier survival estimate for new customer profiles</p>
 
               <div class="space-y-3 text-xs">
                 <div>
@@ -2705,7 +3144,7 @@ html_template = f"""<!DOCTYPE html>
           <div class="kpi-card"><span class="kpi-label">RIGHT-CENSORED</span><div class="kpi-value" id="rep-kpi-censored">{app_data['kpi']['right_censored']}</div><div class="kpi-sub">Active at observation end</div></div>
           <div class="kpi-card"><span class="kpi-label">BEST C-INDEX</span><div class="kpi-value text-forest" id="rep-kpi-cindex">{app_data['kpi']['best_cindex']}</div><div class="kpi-sub">Predictive ranking</div></div>
           <div class="kpi-card"><span class="kpi-label">SIGNAL RETAINED</span><div class="kpi-value" id="rep-kpi-retention">{app_data['kpi']['retention_rate']}</div><div class="kpi-sub">After confidence filtering</div></div>
-          <div class="kpi-card"><span class="kpi-label">FORECAST</span><div class="kpi-value" id="report-horizon-val">{app_data['kpi']['forecast_horizon']} mo</div><div class="kpi-sub">Continuous horizon</div></div>
+          <div class="kpi-card"><span class="kpi-label">FORECAST</span><div class="kpi-value" id="report-horizon-val">{app_data['kpi']['forecast_horizon']} mo</div><div class="kpi-sub">{app_data['kpi']['forecast_points']} eval points</div></div>
         </div>
 
         <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
@@ -2713,14 +3152,14 @@ html_template = f"""<!DOCTYPE html>
             <div>
               <h4 class="font-bold text-branddark text-base">Export Customer Predictions</h4>
               <p class="text-xs text-subtle mt-1">
-                Download real customer-level LTV and retention predictions computed by the PyTorch model for the active dataset (<span id="rep-export-source-name">IBM Telco Benchmark</span>).
+                Download real customer-level LTV and retention predictions computed by the PyTorch model for the active dataset (<span id="rep-export-source-name">{app_data['source_label']}</span>). Note: What-If simulations reflect sensitivity scenarios under proportional hazard assumptions.
               </p>
             </div>
 
             <div class="mt-8 pt-4 border-t border-lineborder flex items-center justify-between">
               <div>
                 <span class="text-xs font-semibold text-charcoal block">Format: Comma-Separated Values (.csv)</span>
-                <span class="text-[11px] text-subtle">Includes <span id="report-horizon-text">{app_data['kpi']['forecast_horizon']}</span>-month individualized survival curves and estimated dynamic CLTV for all <span id="rep-export-count">{app_data['kpi']['subscribers']}</span> customers.</span>
+                <span class="text-[11px] text-subtle">Includes <span id="report-horizon-text">{app_data['kpi']['forecast_horizon']}</span>-month individualized survival curves ({app_data['kpi']['forecast_points']} evaluation points) and estimated dynamic CLTV for all <span id="rep-export-count">{app_data['kpi']['subscribers']}</span> customers.</span>
               </div>
               <button onclick="downloadPredictionsCSV()" class="btn-download-primary shrink-0">
                 <svg class="w-4 h-4 stroke-current" fill="none" viewBox="0 0 24 24">
@@ -2755,11 +3194,11 @@ html_template = f"""<!DOCTYPE html>
               <thead class="bg-[#FAF9F3] text-subtle font-bold border-b border-lineborder">
                 <tr>
                   <th class="py-3 px-5">Model</th>
-                  <th class="py-3 px-5">C-Index (↑)</th>
-                  <th class="py-3 px-5">Integrated Brier Score (↓)</th>
-                  <th class="py-3 px-5">Brier @ 12M</th>
-                  <th class="py-3 px-5">Brier @ 24M</th>
-                  <th class="py-3 px-5">Brier @ 36M</th>
+                  <th class="py-3 px-5 text-right">C-Index (↑)</th>
+                  <th class="py-3 px-5 text-right">Integrated Brier Score (↓)</th>
+                  <th class="py-3 px-5 text-right">Brier @ 12M</th>
+                  <th class="py-3 px-5 text-right">Brier @ 24M</th>
+                  <th class="py-3 px-5 text-right">Brier @ 36M</th>
                 </tr>
               </thead>
               <tbody id="audit-table-body" class="divide-y divide-lineborder text-charcoal">
@@ -2790,31 +3229,54 @@ html_template = f"""<!DOCTYPE html>
     const MODEL_BUNDLE = RAW_SERVER_DATA.model_bundle;
     const DATASETS = RAW_SERVER_DATA.datasets;
 
-    const TIER_TEMPLATES = {{
-      critical: {{
-        segment: 'At-Risk Newbies',
-        urgency: 'Critical Urgency',
-        badgeClass: 'bg-red-100 text-red-800',
-        prescription: 'Early tenure dropout risk detected! Rapid steepening of hazard rate in early months. Action: Trigger automated $15/mo discount linked to 12-month annual contract lock-in to avert immediate churn.',
-        hazard: 'λ = 0.088 / mo',
-        roiText: 'High ROI on Contract Lock-in (+185%)'
-      }},
-      moderate: {{
-        segment: 'Price-Sensitive',
-        urgency: 'Moderate Priority',
-        badgeClass: 'bg-amber-100 text-amber-800',
-        prescription: 'Subscriber shows price sensitivity. Approaching decision boundary. Action: Deploy proactive bundle optimization. Offer $10 bill credit and free speed tier boost.',
-        hazard: 'λ = 0.035 / mo',
-        roiText: 'Projected Net Lift: +$140.00'
-      }},
-      healthy: {{
-        segment: 'Loyal Long-Term',
-        urgency: 'Healthy / Low Risk',
-        badgeClass: 'bg-emerald-100 text-emerald-800',
-        prescription: 'Subscriber displays solid tenure and low hazard rate. Action: Maintain standard VIP loyalty tier. Initiate cross-sell for premium features with zero defensive discounting.',
-        hazard: 'λ = 0.009 / mo',
-        roiText: 'Organic Retention (No Discount Needed)'
+    function classifyRetentionTierJS(ret12, arpuVal, contractName) {{
+      const retClamped = Math.max(0.1, Math.min(99.9, ret12));
+      const lambdaEst = -Math.log(retClamped / 100.0) / 12.0;
+      const hazardStr = `λ ≈ ${{lambdaEst.toFixed(3)}} / mo`;
+      const isM2M = String(contractName || '').toLowerCase().includes('month');
+      const isHighArpu = arpuVal >= 75.0;
+
+      if (retClamped < 35.0) {{
+        let rx = isM2M
+          ? `Elevated early-tenure dropout hazard detected (${{hazardStr}}). Recommendation: Offer annual contract commitment with a $15/mo discount incentive to secure 12-month tenure.`
+          : `Low baseline retention probability (${{retClamped.toFixed(1)}}%). Recommendation: Proactive outreach by retention specialist to assess satisfaction and plan fit.`;
+        return {{
+          segment: 'High Risk Segment',
+          urgency: 'High Priority',
+          badgeClass: 'bg-red-100 text-red-800',
+          prescription: rx,
+          hazard: hazardStr,
+          roiText: isM2M ? 'Target: Annual Lock-In Conversion' : 'Target: Account Health Review'
+        }};
       }}
+      if (retClamped < 70.0) {{
+        let rx = isHighArpu
+          ? `Moderate churn risk on high-value subscriber ($${{arpuVal.toFixed(2)}}/mo). Recommendation: Review plan features and propose bundle optimization to preserve high-margin relationship.`
+          : (isM2M ? 'Subscriber shows moderate decision uncertainty under Month-to-Month terms. Recommendation: Propose 1-year contract extension with digital speed tier upgrade.'
+                   : `Standard moderate retention profile (${{retClamped.toFixed(1)}}% at 12M). Recommendation: Deliver proactive product satisfaction survey and feature update notifications.`);
+        return {{
+          segment: 'Moderate Risk Segment',
+          urgency: 'Medium Priority',
+          badgeClass: 'bg-amber-100 text-amber-800',
+          prescription: rx,
+          hazard: hazardStr,
+          roiText: isHighArpu ? 'Target: High-Value Bundle Optimization' : (isM2M ? 'Target: 1-Year Term Conversion' : 'Target: Proactive Engagement')
+        }};
+      }}
+      return {{
+        segment: 'Stable Retention',
+        urgency: 'Low Priority',
+        badgeClass: 'bg-emerald-100 text-emerald-800',
+        prescription: `Strong organic retention profile (${{retClamped.toFixed(1)}}% at 12M, ${{hazardStr}}). Recommendation: Maintain standard cadence; suppress promotional discounts to protect baseline margins.`,
+        hazard: hazardStr,
+        roiText: 'Target: Organic Margin Protection'
+      }};
+    }}
+
+    const TIER_TEMPLATES = {{
+      critical: {{ segment: 'High Risk Segment', urgency: 'High Priority', badgeClass: 'bg-red-100 text-red-800' }},
+      moderate: {{ segment: 'Moderate Risk Segment', urgency: 'Medium Priority', badgeClass: 'bg-amber-100 text-amber-800' }},
+      healthy: {{ segment: 'Stable Retention', urgency: 'Low Priority', badgeClass: 'bg-emerald-100 text-emerald-800' }}
     }};
 
     function hydrateCustomerDB(datasetObj) {{
@@ -2842,7 +3304,7 @@ html_template = f"""<!DOCTYPE html>
         const contractName = customLabel
           ? String(customLabel)
           : (contractRaw === 2 ? 'Two Year' : (contractRaw === 1 ? 'One Year' : 'Month-to-Month'));
-        const tier = ret12 < 30.0 ? TIER_TEMPLATES.critical : (ret12 < 65.0 ? TIER_TEMPLATES.moderate : TIER_TEMPLATES.healthy);
+        const tier = classifyRetentionTierJS(ret12, arpuVal, contractName);
 
         const drivers = [];
         if (contractRaw === 0) drivers.push('Month-to-Month Contract (+Hazard)');
@@ -2894,13 +3356,35 @@ html_template = f"""<!DOCTYPE html>
     let currentCustId = SERVER_DATA.primary_cid;
     let lastUploadedCSVText = '';
     let lastUploadedCSVName = 'uploaded.csv';
+    let compareModelsMode = false;
+    let gradConformal = null;
+    let gradKm = null;
+    let gradCounter = null;
+    let gradBaseline = null;
     const charts = {{}};
+
+    function escapeHTML(str) {{
+      if (str === null || str === undefined) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }}
 
     function switchTab(tabId) {{
       activeTab = tabId;
-      document.querySelectorAll('.tab-panel').forEach(el => el.classList.add('hidden'));
+      document.querySelectorAll('.tab-panel').forEach(el => {{
+        el.classList.add('hidden');
+        el.classList.remove('tab-content-active');
+      }});
       const activePanel = document.getElementById('tab-' + tabId);
-      if (activePanel) activePanel.classList.remove('hidden');
+      if (activePanel) {{
+        activePanel.classList.remove('hidden');
+        void activePanel.offsetWidth;
+        activePanel.classList.add('tab-content-active');
+      }}
 
       document.querySelectorAll('.nav-link').forEach(btn => btn.classList.remove('active'));
       const activeBtn = document.getElementById('tab-btn-' + tabId);
@@ -2908,10 +3392,10 @@ html_template = f"""<!DOCTYPE html>
 
       const titles = {{
         'overview': {{ title: 'Executive Summary', head: 'Portfolio Health & Dynamic CLTV' }},
-        'pipeline': {{ title: 'Pipeline & Benchmarks', head: '3-Stage Denoising Architecture & Model Leaderboard' }},
-        'customers': {{ title: 'Customer Prescriptions', head: 'Individual Survival Curves & Clinical Actions' }},
+        'pipeline': {{ title: 'Pipeline & Benchmarks', head: '3-Stage Segmentation & Survival Pipeline & Model Leaderboard' }},
+        'customers': {{ title: 'Customer Retention', head: 'Individual Survival Curves & Retention Recommendations' }},
         'simulator': {{ title: 'What-If Simulator', head: 'Counterfactual Retention Strategy & ROI Optimizer' }},
-        'mlops': {{ title: 'MLOps & DriftLens', head: 'DriftLens Population Stability & SurvivalPFN Cold-Start' }},
+        'mlops': {{ title: 'MLOps & DriftLens', head: 'Statistical Drift Monitoring & Non-Parametric Baseline' }},
         'reports': {{ title: 'Audit Reports', head: 'Model Evaluation Audit & CSV Export' }}
       }};
 
@@ -2930,7 +3414,31 @@ html_template = f"""<!DOCTYPE html>
       }});
     }}
 
+    function toggleCompareModels() {{
+      compareModelsMode = !compareModelsMode;
+      const btn = document.getElementById('btn-toggle-compare-models');
+      const ind = document.getElementById('compare-indicator');
+      if (btn && ind) {{
+        if (compareModelsMode) {{
+          btn.classList.add('bg-forest', 'text-white', 'border-forest');
+          btn.classList.remove('bg-[#FAF9F3]', 'text-charcoal');
+          ind.classList.remove('bg-subtle');
+          ind.classList.add('bg-white');
+        }} else {{
+          btn.classList.remove('bg-forest', 'text-white', 'border-forest');
+          btn.classList.add('bg-[#FAF9F3]', 'text-charcoal');
+          ind.classList.add('bg-subtle');
+          ind.classList.remove('bg-white');
+        }}
+      }}
+      if (currentCustId) {{
+        loadCustomer(currentCustId);
+      }}
+    }}
+
     window.addEventListener('DOMContentLoaded', () => {{
+      const overviewPanel = document.getElementById('tab-overview');
+      if (overviewPanel) overviewPanel.classList.add('tab-content-active');
       initCharts();
       applyActiveDataset('ibm', false);
       runSimulation();
@@ -2954,13 +3462,21 @@ html_template = f"""<!DOCTYPE html>
 
       dropdown.innerHTML = '';
       const frag = document.createDocumentFragment();
-      for (let i = 0; i < matchingIds.length; i++) {{
+      const maxDisplay = 5000;
+      const countToRender = Math.min(matchingIds.length, maxDisplay);
+      for (let i = 0; i < countToRender; i++) {{
         const cid = matchingIds[i];
         const c = SERVER_DATA.customer_db[cid];
         const opt = document.createElement('option');
         opt.value = cid;
         opt.textContent = `${{cid}} (${{c.segment}} - ${{c.urgency}})`;
         frag.appendChild(opt);
+      }}
+      if (matchingIds.length > maxDisplay) {{
+        const moreOpt = document.createElement('option');
+        moreOpt.disabled = true;
+        moreOpt.textContent = `... and ${{(matchingIds.length - maxDisplay).toLocaleString()}} more (refine search above)`;
+        frag.appendChild(moreOpt);
       }}
       dropdown.appendChild(frag);
 
@@ -3086,21 +3602,27 @@ html_template = f"""<!DOCTYPE html>
       if (auditBody) auditBody.innerHTML = '';
 
       SERVER_DATA.leaderboard.forEach(m => {{
-        const dCalText = SERVER_DATA.is_inference_only ? 'N/A (Unlabeled)' : (m.d_cal || 'Passed');
+        const dCalText = escapeHTML(SERVER_DATA.is_inference_only ? 'N/A (Unlabeled)' : (m.d_cal || 'Passed'));
+        const safeName = escapeHTML(m.name);
+        const safeCIndex = escapeHTML(m.c_index);
+        const safeIbs = escapeHTML(m.ibs);
+        const safeBs12 = escapeHTML(m.bs12);
+        const safeBs24 = escapeHTML(m.bs24);
+        const safeBs36 = escapeHTML(m.bs36);
         const tr = document.createElement('tr');
         if (m.best) tr.className = 'bg-emerald-50/50 font-semibold';
         tr.innerHTML = `
           <td class="py-3 px-5 flex items-center gap-2">
             ${{m.best ? '<span class="w-2 h-2 rounded-full bg-forest"></span>' : ''}}
-            <span class="${{m.best ? 'text-forest font-bold' : ''}}">${{m.name}}</span>
-            ${{m.best ? '<span class="text-[9px] bg-forest text-white px-1.5 py-0.5 rounded font-bold">BEST</span>' : ''}}
+            <span class="${{m.best ? 'text-forest font-bold' : ''}}">${{safeName}}</span>
+            ${{m.best ? '<span class="text-[9px] bg-forest text-white px-2 py-0.5 rounded-full font-bold uppercase tracking-wider">BEST</span>' : ''}}
           </td>
-          <td class="py-3 px-5 font-bold ${{m.best ? 'text-forest' : ''}}">${{m.c_index}}</td>
-          <td class="py-3 px-5 font-bold ${{m.best ? 'text-forest' : ''}}">${{m.ibs}}</td>
-          <td class="py-3 px-5">${{m.bs12}}</td>
-          <td class="py-3 px-5">${{m.bs24}}</td>
-          <td class="py-3 px-5">${{m.bs36}}</td>
-          <td class="py-3 px-5 ${{m.best ? 'text-forest' : 'text-subtle'}}">${{dCalText}}</td>
+          <td class="py-3 px-5 text-right font-bold font-tabular ${{m.best ? 'text-forest' : ''}}">${{safeCIndex}}</td>
+          <td class="py-3 px-5 text-right font-bold font-tabular ${{m.best ? 'text-forest' : ''}}">${{safeIbs}}</td>
+          <td class="py-3 px-5 text-right font-tabular">${{safeBs12}}</td>
+          <td class="py-3 px-5 text-right font-tabular">${{safeBs24}}</td>
+          <td class="py-3 px-5 text-right font-tabular">${{safeBs36}}</td>
+          <td class="py-3 px-5 text-center ${{m.best ? 'text-forest font-semibold' : 'text-subtle'}}">${{dCalText}}</td>
         `;
         lbBody.appendChild(tr);
 
@@ -3108,12 +3630,12 @@ html_template = f"""<!DOCTYPE html>
           const aTr = document.createElement('tr');
           if (m.best) aTr.className = 'bg-emerald-50/40 font-bold text-forest';
           aTr.innerHTML = `
-            <td class="py-3 px-5">${{m.name}}</td>
-            <td class="py-3 px-5">${{m.c_index}}</td>
-            <td class="py-3 px-5">${{m.ibs}}</td>
-            <td class="py-3 px-5">${{m.bs12}}</td>
-            <td class="py-3 px-5">${{m.bs24}}</td>
-            <td class="py-3 px-5">${{m.bs36}}</td>
+            <td class="py-3 px-5 font-medium">${{safeName}}</td>
+            <td class="py-3 px-5 text-right font-bold font-tabular">${{safeCIndex}}</td>
+            <td class="py-3 px-5 text-right font-bold font-tabular">${{safeIbs}}</td>
+            <td class="py-3 px-5 text-right font-tabular">${{safeBs12}}</td>
+            <td class="py-3 px-5 text-right font-tabular">${{safeBs24}}</td>
+            <td class="py-3 px-5 text-right font-tabular">${{safeBs36}}</td>
           `;
           auditBody.appendChild(aTr);
         }}
@@ -3291,13 +3813,12 @@ html_template = f"""<!DOCTYPE html>
         }}
         const riskDsurv = Math.exp(Math.max(-20.0, Math.min(20.0, logHazardDsurv)));
         const riskCox = Math.exp(Math.max(-20.0, Math.min(20.0, logHazardCox)));
-        const riskRsf = Math.exp(Math.max(-2.5, Math.min(2.5, logHazardCox * 0.85 + 0.05)));
-        const riskDhit = Math.exp(Math.max(-2.5, Math.min(2.5, logHazardDsurv * 0.96 - 0.03)));
-
         const cDsurv = baseS0.map(s0 => Number(Math.pow(s0, riskDsurv).toFixed(3)));
         const cCox = baseS0.map(s0 => Number(Math.pow(s0, riskCox).toFixed(3)));
-        const cRsf = baseS0.map(s0 => Number(Math.pow(s0, riskRsf).toFixed(3)));
-        const cDhit = baseS0.map(s0 => Number(Math.pow(s0, riskDhit).toFixed(3)));
+        // For client-side synthesized cohorts without server execution, RSF and DeepHit
+        // default to empirical baseline reference curves rather than fabricating multiplier curves
+        const cRsf = baseS0.map(s0 => Number(s0.toFixed(3)));
+        const cDhit = baseS0.map(s0 => Number(s0.toFixed(3)));
 
         for (let k = 0; k < 16; k++) {{
           curveSumDsurv[k] += cDsurv[k];
@@ -3397,11 +3918,11 @@ html_template = f"""<!DOCTYPE html>
       const bestIbs = isInferenceOnly ? 'N/A' : leaderboard[0].ibs;
 
       const cohortBars = [
-        Number(Math.min(95, Math.max(5, (sumMC / n) / 2.3)).toFixed(1)),
-        Number(Math.min(95, Math.max(5, (durations.reduce((a, b) => a + b, 0) / n) * 0.9)).toFixed(1)),
-        Number(Math.min(95, Math.max(5, (sumM2M / n) * 72.0)).toFixed(1)),
-        Number(Math.min(95, Math.max(5, (sumST / n) * 28.0)).toFixed(1)),
-        Number(Math.min(95, Math.max(5, (sumTC / n) / 45.0)).toFixed(1))
+        Number(Math.min(100.0, Math.max(1.0, ((sumMC / n) / 120.0) * 100.0)).toFixed(1)),
+        Number(Math.min(100.0, Math.max(1.0, ((durations.reduce((a, b) => a + b, 0) / n) / 72.0) * 100.0)).toFixed(1)),
+        Number(Math.min(100.0, Math.max(1.0, (sumM2M / n) * 100.0)).toFixed(1)),
+        Number(Math.min(100.0, Math.max(1.0, ((sumST / n) / 10.0) * 100.0)).toFixed(1)),
+        Number(Math.min(100.0, Math.max(1.0, ((sumTC / n) / 8000.0) * 100.0)).toFixed(1))
       ];
       const refBars = MODEL_BUNDLE.ref_drift_bars;
       const meanDiff = cohortBars.reduce((acc, v, i) => acc + Math.abs(v - refBars[i]), 0) / 5.0;
@@ -3566,7 +4087,8 @@ html_template = f"""<!DOCTYPE html>
 
     function sanitizeCSVCellJS(val) {{
       const s = String(val ?? '').trim();
-      if (s.length > 0 && ['=', '+', '-', '@', '\\t', '\\r'].includes(s[0])) {{
+      const dangerousTriggers = ['=', '+', '-', '@', '|', '\\t', '\\r', '\uff1d', '\uff0b', '\uff0d', '\uff20'];
+      if (s.length > 0 && dangerousTriggers.includes(s[0])) {{
         return "'" + s;
       }}
       return s;
@@ -4164,6 +4686,11 @@ html_template = f"""<!DOCTYPE html>
       }});
 
       const ctxKm = document.getElementById('pipelineKmChart').getContext('2d');
+      gradKm = ctxKm.createLinearGradient(0, 0, 0, 240);
+      gradKm.addColorStop(0, 'rgba(59, 87, 64, 0.18)');
+      gradKm.addColorStop(0.7, 'rgba(59, 87, 64, 0.04)');
+      gradKm.addColorStop(1, 'rgba(59, 87, 64, 0.00)');
+
       charts.km = new Chart(ctxKm, {{
         type: 'line',
         data: {{
@@ -4173,7 +4700,7 @@ html_template = f"""<!DOCTYPE html>
               label: 'Predicted DeepSurv',
               data: SERVER_DATA.km_overlay.dsurv_points,
               borderColor: '#3B5740',
-              backgroundColor: 'rgba(59, 87, 64, 0.08)',
+              backgroundColor: gradKm,
               borderWidth: 2.5,
               tension: 0.3,
               fill: true
@@ -4201,6 +4728,11 @@ html_template = f"""<!DOCTYPE html>
       }});
 
       const ctxConformal = document.getElementById('customerConformalChart').getContext('2d');
+      gradConformal = ctxConformal.createLinearGradient(0, 0, 0, 260);
+      gradConformal.addColorStop(0, 'rgba(59, 87, 64, 0.22)');
+      gradConformal.addColorStop(0.7, 'rgba(59, 87, 64, 0.05)');
+      gradConformal.addColorStop(1, 'rgba(59, 87, 64, 0.00)');
+
       const timeSteps = Array.from({{ length: 16 }}, (_, i) => (i * 3) + 'M');
       charts.conformal = new Chart(ctxConformal, {{
         type: 'line',
@@ -4211,7 +4743,7 @@ html_template = f"""<!DOCTYPE html>
               label: 'Upper 90% Bound',
               data: [],
               borderColor: 'transparent',
-              backgroundColor: 'rgba(59, 87, 64, 0.15)',
+              backgroundColor: 'rgba(59, 87, 64, 0.12)',
               pointRadius: 0,
               fill: '+1'
             }},
@@ -4226,9 +4758,10 @@ html_template = f"""<!DOCTYPE html>
               label: 'Point Estimate S(t|x)',
               data: [],
               borderColor: '#3B5740',
+              backgroundColor: gradConformal,
               borderWidth: 2.5,
               tension: 0.35,
-              fill: false
+              fill: true
             }}
           ]
         }},
@@ -4244,6 +4777,16 @@ html_template = f"""<!DOCTYPE html>
       }});
 
       const ctxCounter = document.getElementById('counterfactualChart').getContext('2d');
+      gradCounter = ctxCounter.createLinearGradient(0, 0, 0, 260);
+      gradCounter.addColorStop(0, 'rgba(59, 87, 64, 0.20)');
+      gradCounter.addColorStop(0.7, 'rgba(59, 87, 64, 0.04)');
+      gradCounter.addColorStop(1, 'rgba(59, 87, 64, 0.00)');
+
+      gradBaseline = ctxCounter.createLinearGradient(0, 0, 0, 260);
+      gradBaseline.addColorStop(0, 'rgba(189, 100, 72, 0.16)');
+      gradBaseline.addColorStop(0.7, 'rgba(189, 100, 72, 0.04)');
+      gradBaseline.addColorStop(1, 'rgba(189, 100, 72, 0.00)');
+
       charts.counterfactual = new Chart(ctxCounter, {{
         type: 'line',
         data: {{
@@ -4253,15 +4796,16 @@ html_template = f"""<!DOCTYPE html>
               label: 'Baseline S(t)',
               data: [],
               borderColor: '#BD6448',
+              backgroundColor: gradBaseline,
               borderWidth: 2,
               tension: 0.3,
-              fill: false
+              fill: true
             }},
             {{
               label: 'Counterfactual S*(t)',
               data: [],
               borderColor: '#3B5740',
-              backgroundColor: 'rgba(59, 87, 64, 0.12)',
+              backgroundColor: gradCounter,
               borderWidth: 2.5,
               tension: 0.3,
               fill: true
@@ -4333,18 +4877,34 @@ html_template = f"""<!DOCTYPE html>
       }}
 
       pqBody.innerHTML = '';
+      if (candidates.length === 0) {{
+        const emptyTr = document.createElement('tr');
+        emptyTr.innerHTML = `
+          <td colspan="7" class="py-8 px-5 text-center text-subtle italic text-xs">
+            No subscribers match the selected filter criteria.
+          </td>
+        `;
+        pqBody.appendChild(emptyTr);
+        return;
+      }}
       candidates.slice(0, 6).forEach(c => {{
-        const badgeClass = c.badgeClass || 'bg-red-100 text-red-800';
+        const badgeClass = escapeHTML(c.badgeClass || 'bg-red-100 text-red-800');
+        const safeId = escapeHTML(c.id);
+        const safeSegment = escapeHTML(c.segment);
+        const safeArpu = escapeHTML(c.arpu);
+        const safeLtv = escapeHTML(c.ltv);
+        const safeRet12 = escapeHTML(c.ret12);
+        const safeUrgency = escapeHTML(c.urgency);
         const tr = document.createElement('tr');
         tr.className = 'hover:bg-[#FCFBF8] transition';
         tr.innerHTML = `
-          <td class="py-3 px-5 font-bold">${{c.id}}</td>
-          <td class="py-3 px-5">${{c.segment}}</td>
-          <td class="py-3 px-5">${{c.arpu}}</td>
-          <td class="py-3 px-5 font-semibold text-terracotta">${{c.ltv}}</td>
-          <td class="py-3 px-5">${{c.ret12}}</td>
-          <td class="py-3 px-5"><span class="px-2.5 py-1 rounded-full ${{badgeClass}} font-semibold text-[10px]">${{c.urgency}}</span></td>
-          <td class="py-3 px-5 text-right"><button onclick="selectCustomer('${{c.id}}')" class="px-2.5 py-1 rounded-lg bg-[#ECEBE3] hover:bg-[#E2E0D4] font-semibold text-[11px]">Prescribe</button></td>
+          <td class="py-3 px-5 font-bold text-branddark">${{safeId}}</td>
+          <td class="py-3 px-5 font-medium">${{safeSegment}}</td>
+          <td class="py-3 px-5 text-right font-medium font-tabular">${{safeArpu}}</td>
+          <td class="py-3 px-5 text-right font-bold text-terracotta font-tabular">${{safeLtv}}</td>
+          <td class="py-3 px-5 text-right font-medium font-tabular">${{safeRet12}}</td>
+          <td class="py-3 px-5 text-center"><span class="px-2.5 py-1 rounded-full ${{badgeClass}} font-semibold text-[10px] tracking-wide inline-block">${{safeUrgency}}</span></td>
+          <td class="py-3 px-5 text-right"><button data-cid="${{safeId}}" onclick="selectCustomer(this.getAttribute('data-cid'))" class="px-2.5 py-1 rounded-lg bg-[#ECEBE3] hover:bg-[#E2E0D4] font-semibold text-[11px] text-charcoal transition cursor-pointer shadow-2xs">Inspect</button></td>
         `;
         pqBody.appendChild(tr);
       }});
@@ -4374,9 +4934,108 @@ html_template = f"""<!DOCTYPE html>
       const lowerBounds = activeCurve.map(v => Math.max(0.0, Number((v - qBand).toFixed(3))));
 
       if (charts.conformal) {{
-        charts.conformal.data.datasets[0].data = upperBounds;
-        charts.conformal.data.datasets[1].data = lowerBounds;
-        charts.conformal.data.datasets[2].data = activeCurve;
+        if (compareModelsMode) {{
+          const cDsurv = (cust.curves && cust.curves.deepsurv) || activeCurve;
+          const cCox = (cust.curves && cust.curves.coxph) || activeCurve;
+          const cRsf = (cust.curves && cust.curves.rsf) || activeCurve;
+          const cDhit = (cust.curves && cust.curves.deephit) || activeCurve;
+
+          charts.conformal.data.datasets = [
+            {{
+              label: 'Upper 90% Bound',
+              data: upperBounds,
+              borderColor: 'transparent',
+              backgroundColor: 'rgba(59, 87, 64, 0.08)',
+              pointRadius: 0,
+              fill: '+1'
+            }},
+            {{
+              label: 'Lower 90% Bound',
+              data: lowerBounds,
+              borderColor: 'transparent',
+              pointRadius: 0,
+              fill: false
+            }},
+            {{
+              label: 'DeepSurv (PyTorch)',
+              data: cDsurv,
+              borderColor: '#3B5740',
+              borderWidth: 2.5,
+              borderDash: [],
+              tension: 0.35,
+              pointRadius: 1.5,
+              fill: false
+            }},
+            {{
+              label: 'CoxPH Baseline',
+              data: cCox,
+              borderColor: '#2563EB',
+              borderWidth: 2,
+              borderDash: [5, 4],
+              tension: 0.35,
+              pointRadius: 1.5,
+              fill: false
+            }},
+            {{
+              label: 'Random Survival Forest',
+              data: cRsf,
+              borderColor: '#DC2626',
+              borderWidth: 2,
+              borderDash: [6, 3],
+              tension: 0.35,
+              pointRadius: 1.5,
+              fill: false
+            }},
+            {{
+              label: 'DeepHit Discrete',
+              data: cDhit,
+              borderColor: '#D97706',
+              borderWidth: 2,
+              borderDash: [2, 2],
+              tension: 0.35,
+              pointRadius: 1.5,
+              fill: false
+            }}
+          ];
+          charts.conformal.options.plugins.legend = {{
+            display: true,
+            labels: {{
+              filter: (item) => !item.text.includes('Bound'),
+              boxWidth: 12,
+              font: {{ size: 10, family: 'Plus Jakarta Sans' }}
+            }}
+          }};
+        }} else {{
+          charts.conformal.data.datasets = [
+            {{
+              label: 'Upper 90% Bound',
+              data: upperBounds,
+              borderColor: 'transparent',
+              backgroundColor: 'rgba(59, 87, 64, 0.12)',
+              pointRadius: 0,
+              fill: '+1'
+            }},
+            {{
+              label: 'Lower 90% Bound',
+              data: lowerBounds,
+              borderColor: 'transparent',
+              pointRadius: 0,
+              fill: false
+            }},
+            {{
+              label: 'Point Estimate S(t|x)',
+              data: activeCurve,
+              borderColor: '#3B5740',
+              backgroundColor: gradConformal,
+              borderWidth: 2.5,
+              borderDash: [],
+              tension: 0.35,
+              pointRadius: 1.5,
+              fill: true
+            }}
+          ];
+          charts.conformal.options.plugins.legend = {{ display: false }};
+        }}
         charts.conformal.update('none');
       }}
       runSimulation();
@@ -4392,6 +5051,12 @@ html_template = f"""<!DOCTYPE html>
       if (dropdown) dropdown.value = id;
       loadCustomer(id);
       switchTab('customers');
+    }}
+
+    function simulateCustomer(id) {{
+      if (id) selectCustomer(id);
+      switchTab('simulator');
+      if (typeof runSimulation === 'function') runSimulation();
     }}
 
     function resetSimulation() {{
@@ -4513,7 +5178,18 @@ html_template = f"""<!DOCTYPE html>
       const tsCode = service === 'none' ? 0 : (service === 'dsl' ? 1 : 0);
       const osCode = service === 'dsl' ? 1 : 0;
       const pbCode = service === 'fiber' ? 1 : 0;
-      const xRaw = [charge, charge * 1.0, 1, ctCode, tsCode, osCode, pbCode];
+      const knownValues = {{
+        monthly_charges: charge,
+        total_charges: charge * 1.0,
+        support_tickets: 1,
+        contract_type: ctCode,
+        tech_support: tsCode,
+        online_security: osCode,
+        paperless_billing: pbCode
+      }};
+      const featCols = MODEL_BUNDLE.feat_cols || ['monthly_charges', 'total_charges', 'support_tickets', 'contract_type', 'tech_support', 'online_security', 'paperless_billing'];
+      const refMeds = MODEL_BUNDLE.ref_medians || {{}};
+      const xRaw = featCols.map(col => knownValues[col] !== undefined ? knownValues[col] : (refMeds[col] || 0.0));
       const sMean = MODEL_BUNDLE.scaler_mean || [];
       const sScale = MODEL_BUNDLE.scaler_scale || [];
       const centers = MODEL_BUNDLE.kmeans_centers || [];
@@ -4731,4 +5407,17 @@ html_template = f"""<!DOCTYPE html>
 </html>
 """
 
+# Clear initial loading splash screen
+splash_placeholder.empty()
+
 components.html(html_template, height=1000, scrolling=True)
+
+if __name__ == "__main__":
+    if not _has_active_streamlit_ctx():
+        if "--dry-run" in sys.argv:
+            sys.exit(0)
+        import subprocess
+        _cmd = [sys.executable, "-m", "streamlit", "run", os.path.abspath(__file__)] + [
+            a for a in sys.argv[1:] if a != "--dry-run"
+        ]
+        sys.exit(subprocess.call(_cmd))

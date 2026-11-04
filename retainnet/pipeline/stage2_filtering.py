@@ -4,8 +4,9 @@ from typing import Tuple, Optional
 
 class InstanceFilteringStage:
     """
-    Stage 2 (Instance Filtering): Supervised Logistic Regression filter to eliminate noisy data.
-    Filters out uninformative or boundary samples before passing to Stage 3 survival models.
+    Stage 2 (Instance Filtering): Supervised Logistic Regression filter for training-time boundary filtering.
+    Filters out ambiguous boundary samples during training before passing to Stage 3 survival models.
+    At inference time, preserves 100% of customer records while reporting filtering confidence.
     """
     def __init__(self, low_threshold: float = 0.30, high_threshold: float = 0.70, random_state: int = 42):
         self.low_threshold = low_threshold
@@ -28,6 +29,9 @@ class InstanceFilteringStage:
         E: np.ndarray,
         T: Optional[np.ndarray] = None
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Fits propensity classifier and returns filtered training subset.
+        """
         n_clusters = max(int(np.max(cluster_labels)) + 1 if len(cluster_labels) > 0 else 1, 4)
         self.n_clusters = n_clusters
         one_hot_clusters = self._create_one_hot(cluster_labels, n_clusters)
@@ -41,9 +45,7 @@ class InstanceFilteringStage:
 
         # Censoring-aware sample weighting:
         # Confirmed churn events (E=1) have certainty 1.0.
-        # Censored observations (E=0) have only been observed without churn up to time T.
-        # Downweight early-censored observations proportional to their observed follow-up so
-        # they are not mistakenly treated as guaranteed lifelong non-churners.
+        # Censored observations (E=0) downweighted proportional to observed follow-up.
         sample_weight = None
         if T is not None and len(T) == len(E):
             max_t = float(np.max(T)) if len(T) > 0 and np.max(T) > 0 else 1.0
@@ -56,9 +58,10 @@ class InstanceFilteringStage:
         probs = self.classifier.predict_proba(X_aug)
         probs_positive = probs[:, 1]
 
+        # Filter out boundary samples for training boundary analysis
         keep_mask = (probs_positive < self.low_threshold) | (probs_positive > self.high_threshold)
         
-        # Support micro-datasets down to 1 row; only fall back if filtering leaves 0 instances
+        # Micro-dataset fallback: if all filtered, retain all
         if np.sum(keep_mask) == 0:
             keep_mask = np.ones(len(E), dtype=bool)
         

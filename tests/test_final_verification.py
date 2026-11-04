@@ -58,34 +58,32 @@ class TestTimeHorizonConsistency(unittest.TestCase):
         self.assertGreater(spacing, 1.0)
         self.assertAlmostEqual(spacing, 71.0 / 47.0, places=5)
 
-    def test_dashboard_forecast_horizon_label(self):
-        """Dashboard displays `len(time_grid)` as forecast horizon.
-        This is the number of evaluation points (48), not the time span in months.
-        With max_duration=72, the actual time span is 72 months, but the label says '48 mo'."""
+    def test_dashboard_forecast_horizon_metadata_truthful(self):
+        """Dashboard truthfully distinguishes time horizon span (months) from grid points count."""
         max_duration = 72.0
         time_grid = np.linspace(1.0, max(24.0, max_duration), 48)
-        forecast_horizon_displayed = len(time_grid)  # This is what the dashboard shows
-        actual_time_span_months = time_grid[-1] - time_grid[0] + 1  # ~72
-        # These are different: the label is misleading
-        self.assertEqual(forecast_horizon_displayed, 48)
-        self.assertAlmostEqual(actual_time_span_months, 72.0, delta=1.0)
+        
+        chronological_horizon_months = int(np.round(time_grid[-1]))
+        forecast_points_count = len(time_grid)
+        
+        # Verify that chronological endpoint and grid count are cleanly distinguished
+        self.assertEqual(chronological_horizon_months, 72)
+        self.assertEqual(forecast_points_count, 48)
+        self.assertAlmostEqual(time_grid[-1], 72.0, places=4)
 
-    def test_dashboard_forecast_horizon_label_is_misleading(self):
-        """
-        Dashboard displays `len(time_grid)` as forecast horizon.
-        This is the sampling resolution (48 points), NOT the chronological horizon endpoint (72 months).
-        With max_duration=72, the actual time span is 72 months, but the label displays '48 mo'.
-        This test explicitly documents that the current label is potentially misleading because it
-        reports the grid point count rather than the final chronological time coordinate.
-        """
-        max_duration = 72.0
-        time_grid = np.linspace(1.0, max(24.0, max_duration), 48)
-        forecast_horizon_displayed = len(time_grid)  # Point count: 48
-        actual_time_span_months = float(time_grid[-1])  # Chronological endpoint: 72.0
-
-        self.assertEqual(forecast_horizon_displayed, 48)
-        self.assertAlmostEqual(actual_time_span_months, 72.0, places=4)
-        self.assertNotEqual(forecast_horizon_displayed, int(actual_time_span_months))
+    def test_dashboard_forecast_horizon_label_is_truthful(self):
+        """Verify that pipeline KPI metadata and UI display labels truthfully report horizon months and points."""
+        from dashboard import execute_retainnet_pipeline
+        bundle = execute_retainnet_pipeline()
+        
+        # Check active payload KPI dictionary
+        active_kpi = bundle["ibm_payload"]["kpi"]
+        self.assertIn("forecast_horizon", active_kpi)
+        self.assertIn("forecast_points", active_kpi)
+        
+        # Horizon must be the actual time span in months (72), not the point count (48)
+        self.assertEqual(active_kpi["forecast_horizon"], 72)
+        self.assertEqual(active_kpi["forecast_points"], 48)
 
     def test_cltv_calculator_uses_time_values_not_count(self):
         """CLTV integration uses actual time values for trapezoidal rule,
@@ -1172,12 +1170,15 @@ class TestReproducibilityAndIsolationSuite(unittest.TestCase):
             self.assertTrue(np.all(np.isfinite(risk)))
             self.assertTrue(np.all(np.isfinite(surv)))
             self.assertTrue(np.all(surv >= 0.0) and np.all(surv <= 1.0))
+            # Verify feature dependency: risk scores and survival functions must not be constant across samples
+            self.assertGreater(float(np.ptp(risk)), 1e-4, "RSF predictions must be feature-dependent, not constant")
+            self.assertGreater(float(np.max(np.abs(surv[0] - surv[-1]))), 1e-4, "RSF survival curves must be individualized")
         else:
             self.assertFalse(rsf.is_fallback)
             self.assertEqual(rsf.model_display_name, "Random Survival Forest")
 
     def test_drop_total_charges_configuration(self):
-        """drop_total_charges=True must omit TotalCharges and AvgMonthlyCharge without breaking pipeline."""
+        """drop_total_charges=True must omit TotalCharges without breaking pipeline, preventing target leakage."""
         from retainnet.data import DataPreprocessingPipeline
         import pandas as pd
 
@@ -1192,22 +1193,54 @@ class TestReproducibilityAndIsolationSuite(unittest.TestCase):
             "event": [1, 0, 1, 0]
         })
 
-        # Default: drop_total_charges=False -> feature is retained
+        # Default: drop_total_charges=False -> total_charges is retained, AvgMonthlyCharge never leaks duration
         pipe_default = DataPreprocessingPipeline(drop_total_charges=False)
         X_def, _, _ = pipe_default.fit_transform(df_test)
         self.assertIn("total_charges", pipe_default.feature_names)
-        self.assertIn("AvgMonthlyCharge", pipe_default.feature_names)
+        self.assertNotIn("AvgMonthlyCharge", pipe_default.feature_names)
+        self.assertNotIn("tenure", pipe_default.feature_names)
+        self.assertNotIn("duration", pipe_default.feature_names)
 
-        # Opt-in: drop_total_charges=True -> feature and ratio are omitted
+        # Opt-in: drop_total_charges=True -> total_charges is omitted
         pipe_drop = DataPreprocessingPipeline(drop_total_charges=True)
         X_drop, _, _ = pipe_drop.fit_transform(df_test)
         self.assertNotIn("total_charges", pipe_drop.feature_names)
         self.assertNotIn("AvgMonthlyCharge", pipe_drop.feature_names)
-        self.assertEqual(X_drop.shape[1], X_def.shape[1] - 2)
+        self.assertEqual(X_drop.shape[1], X_def.shape[1] - 1)
 
         # Transform on new data with drop_total_charges=True
         X_drop_t, _, _ = pipe_drop.transform(df_test)
         self.assertEqual(X_drop_t.shape[1], X_drop.shape[1])
+
+    def test_target_duration_invariance_no_leakage(self):
+        """Proves that changing target duration alone does NOT change the derived feature matrix."""
+        from retainnet.data import DataPreprocessingPipeline
+        import pandas as pd
+        import numpy as np
+
+        df_a = pd.DataFrame({
+            "tenure": [6, 12, 24, 36],
+            "monthly_charges": [50.0, 70.0, 65.0, 80.0],
+            "total_charges": [300.0, 840.0, 1560.0, 2880.0],
+            "contract_type": [0, 1, 2, 0],
+            "num_services": [2, 3, 4, 2],
+            "support_tickets": [1, 0, 2, 3],
+            "duration": [6.0, 12.0, 24.0, 36.0],
+            "event": [1, 0, 1, 0]
+        })
+
+        df_b = df_a.copy()
+        # Radically modify target duration alone
+        df_b["tenure"] = [999.0, 1.0, 48.0, 72.0]
+        df_b["duration"] = [999.0, 1.0, 48.0, 72.0]
+
+        pipe = DataPreprocessingPipeline()
+        X_a, _, _ = pipe.fit_transform(df_a)
+        X_b, _, _ = pipe.transform(df_b)
+
+        # Features must be strictly identical regardless of survival target duration
+        np.testing.assert_allclose(X_a, X_b, rtol=1e-5, atol=1e-5,
+                                   err_msg="Target duration modified predictor features, proving target leakage!")
 
     def test_total_charges_leakage_diagnostics(self):
         """Diagnostic verification distinguishing real Telco duration proxy from synthetic benchmark."""

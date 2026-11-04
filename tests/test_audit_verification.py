@@ -14,6 +14,10 @@ Covers:
 import os
 import sys
 
+# Prevent Windows loky subprocess physical core detection warning
+if "LOKY_MAX_CPU_COUNT" not in os.environ:
+    os.environ["LOKY_MAX_CPU_COUNT"] = str(os.cpu_count() or 4)
+
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 _root_dir = os.path.abspath(os.path.join(_this_dir, ".."))
 if _root_dir in sys.path:

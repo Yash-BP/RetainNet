@@ -5,10 +5,11 @@ from typing import List, Optional
 def sanitize_csv_cell(val: any) -> str:
     """
     Sanitizes values against CSV/Spreadsheet Formula Injection.
-    Prepends a single quote if the string begins with dangerous formula triggers (=, +, -, @, \\t, \\r).
+    Prepends a single quote if the string begins with dangerous formula triggers
+    (=, +, -, @, |, \t, \r, and Unicode fullwidth formula triggers).
     """
     s = str(val) if val is not None else ""
-    if s and s[0] in ('=', '+', '-', '@', '\t', '\r'):
+    if s and (s[0] in ('=', '+', '-', '@', '|', '\t', '\r') or s[0] in ('\uff1d', '\uff0b', '\uff0d', '\uff20')):
         return "'" + s
     return s
 
@@ -47,6 +48,12 @@ class DynamicLTVCalculator:
         time_arr = np.asarray(time_horizon_months, dtype=float)
         if len(time_arr) == 0:
             return np.zeros(len(isd_arr)) - ac_val
+
+        # Ensure monotonically increasing time axis for correct trapezoidal integration
+        if len(time_arr) > 1 and np.any(np.diff(time_arr) < 0):
+            sort_idx = np.argsort(time_arr)
+            time_arr = time_arr[sort_idx]
+            isd_arr = isd_arr[:, sort_idx]
 
         discount_factors = 1.0 / np.power(1.0 + d, time_arr)
 

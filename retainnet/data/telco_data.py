@@ -13,20 +13,37 @@ class TelcoDatasetLoader:
         if self.filepath is not None:
             if not os.path.isfile(self.filepath):
                 raise FileNotFoundError(f"Specified Telco dataset file not found: {self.filepath}")
-            return self._parse_csv(self.filepath)
-        return self._generate_benchmark_telco(n_samples=2500)
+            df = self._parse_csv(self.filepath)
+            df.attrs["provenance"] = "real_telco_csv"
+            df.attrs["is_real"] = True
+            df.attrs["source_description"] = f"Real Telco Dataset: {os.path.basename(self.filepath)}"
+            return df
+        df = self._generate_benchmark_telco(n_samples=2500)
+        df.attrs["provenance"] = "synthetic_telco_benchmark"
+        df.attrs["is_real"] = False
+        df.attrs["source_description"] = "Synthetic Telco Benchmark Cohort (Weibull DGP)"
+        return df
 
     @classmethod
     def load_telco_data(cls, filepath: Optional[str] = None, n_samples: int = 2500) -> pd.DataFrame:
         """
-        Class method for direct benchmark dataset loading in dashboard / CLI.
+        Class method for direct dataset loading in dashboard / CLI.
+        Truthfully distinguishes real source CSV from synthetic benchmark generation.
         """
         if filepath is not None:
             if not os.path.isfile(filepath):
                 raise FileNotFoundError(f"Specified Telco dataset file not found: {filepath}")
             loader = cls(filepath)
-            return loader._parse_csv(filepath)
-        return cls._generate_benchmark_telco(n_samples=n_samples)
+            df = loader._parse_csv(filepath)
+            df.attrs["provenance"] = "real_telco_csv"
+            df.attrs["is_real"] = True
+            df.attrs["source_description"] = f"Real Telco Dataset: {os.path.basename(filepath)}"
+            return df
+        df = cls._generate_benchmark_telco(n_samples=n_samples)
+        df.attrs["provenance"] = "synthetic_telco_benchmark"
+        df.attrs["is_real"] = False
+        df.attrs["source_description"] = f"Synthetic Telco Benchmark Cohort (Weibull DGP, {n_samples:,} records)"
+        return df
 
     @staticmethod
     def _parse_csv(filepath: str) -> pd.DataFrame:

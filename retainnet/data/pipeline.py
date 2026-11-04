@@ -20,6 +20,7 @@ class DataPreprocessingPipeline:
     @staticmethod
     def _clean_currency_columns(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
+        df = df.replace([np.inf, -np.inf], np.nan)
         for col in ('monthly_charges', 'MonthlyCharges', 'total_charges', 'TotalCharges', 'duration', 'tenure'):
             if col in df.columns and df[col].dtype == 'object':
                 cleaned = (
@@ -43,9 +44,9 @@ class DataPreprocessingPipeline:
         num_services_col = col_names.get('num_services')
         contract_col = col_names.get('contract_type', col_names.get('contract'))
 
-        if total_charges_col and tenure_col and not self.drop_total_charges:
-            if pd.api.types.is_numeric_dtype(df[total_charges_col]) and pd.api.types.is_numeric_dtype(df[tenure_col]):
-                df['AvgMonthlyCharge'] = df[total_charges_col] / np.maximum(df[tenure_col], 1)
+        # Target leakage prevention: Survival duration (tenure/duration) is the target variable T.
+        # It must NEVER be used to derive predictor features (e.g. AvgMonthlyCharge = TotalCharges / tenure).
+        # Predictors must strictly represent information known at baseline prior to event occurrence.
         
         if monthly_charges_col and num_services_col:
             if pd.api.types.is_numeric_dtype(df[monthly_charges_col]) and pd.api.types.is_numeric_dtype(df[num_services_col]):

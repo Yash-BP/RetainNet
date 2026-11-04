@@ -3,7 +3,9 @@ from scipy import stats
 
 class DriftDetector:
     """
-    DriftLens-inspired concept drift detection for RetainNet.
+    Concept and Covariate Drift Detection Engine for RetainNet.
+    Monitors feature distribution shifts using Population Stability Index (PSI)
+    and Kolmogorov-Smirnov (KS) tests with Bonferroni multiple-comparison correction.
     """
     def __init__(self, psi_threshold=0.20, ks_alpha=0.05):
         self.psi_threshold = psi_threshold
@@ -47,7 +49,7 @@ class DriftDetector:
 
     def detect_drift(self, X_new):
         """
-        Computes PSI and KS test for each feature to detect drift.
+        Computes PSI and KS test for each feature to detect drift with multiple-testing control.
         """
         if self.reference_data is None:
             raise RuntimeError("DriftDetector has not been fitted with reference data.")
@@ -71,6 +73,9 @@ class DriftDetector:
         ks_p_values = []
         drifted_features = []
         
+        # Bonferroni corrected significance threshold across features
+        adjusted_alpha = self.ks_alpha / max(1, self.n_features)
+        
         for i in range(self.n_features):
             ref_col = self.reference_data[:, i]
             new_col = X_new[:, i] if i < X_new.shape[1] else np.array([])
@@ -85,7 +90,7 @@ class DriftDetector:
             ks_stats.append(float(ks_stat))
             ks_p_values.append(float(p_value))
             
-            if psi > self.psi_threshold or p_value < self.ks_alpha:
+            if psi > self.psi_threshold or p_value < adjusted_alpha:
                 drifted_features.append(i)
                 
         overall_drift = len(drifted_features) > 0

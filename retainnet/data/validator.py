@@ -8,7 +8,7 @@ import io
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 
@@ -142,14 +142,31 @@ def _encode_contract_or_category(series: pd.Series) -> Tuple[pd.Series, Optional
     return encoded, clean_str
 
 
+def _clean_header_string(header: Any) -> str:
+    """Strips BOM marks, surrounding quotes, and extraneous whitespace."""
+    s = str(header).strip().lstrip("\ufeff").strip("\"'")
+    return s
+
+
 def _normalize_column_names(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """Map user columns to canonical RetainNet column names based on aliases."""
+    cleaned_cols = [_clean_header_string(c) for c in df.columns]
+    if cleaned_cols != list(df.columns):
+        df = df.rename(columns=dict(zip(df.columns, cleaned_cols)))
+
     rename_map: Dict[str, str] = {}
     col_lower_map: Dict[str, str] = {}
     for c in df.columns:
-        norm = str(c).lower().strip().replace(" ", "_").replace("-", "_")
+        s = str(c).strip()
+        # CamelCase split: e.g. MonthlyCharges -> Monthly_Charges
+        s_camel = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)
+        norm = s_camel.lower().replace(" ", "_").replace("-", "_").replace(".", "_")
         col_lower_map[norm] = c
         col_lower_map[norm.replace("_", "")] = c
+        # Plain lowercase normalization
+        norm_plain = s.lower().replace(" ", "_").replace("-", "_").replace(".", "_")
+        col_lower_map[norm_plain] = c
+        col_lower_map[norm_plain.replace("_", "")] = c
 
     used_orig_cols = set()
     for canonical, aliases in COLUMN_ALIASES.items():
@@ -157,7 +174,7 @@ def _normalize_column_names(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, s
             used_orig_cols.add(canonical)
             continue
         for alias in aliases:
-            norm_alias = alias.lower().strip().replace(" ", "_").replace("-", "_")
+            norm_alias = alias.lower().strip().replace(" ", "_").replace("-", "_").replace(".", "_")
             orig_col = col_lower_map.get(norm_alias, col_lower_map.get(norm_alias.replace("_", "")))
             if orig_col is not None and orig_col not in used_orig_cols:
                 rename_map[orig_col] = canonical
@@ -303,12 +320,20 @@ def validate_customer_csv(
     elif not has_duration:
         return ValidationResult(
             is_valid=False,
-            error_message="Missing required survival duration column ('duration' or 'tenure'). Required for survival analysis."
+            error_message=(
+                "Missing required survival duration column ('duration' or 'tenure'). "
+                "Required for survival benchmarking. If providing unlabeled data for scoring, "
+                "omit both duration and event to activate inference-only mode."
+            )
         )
     elif not has_event:
         return ValidationResult(
             is_valid=False,
-            error_message="Missing required event indicator column ('event' or 'churn'). Required for survival analysis."
+            error_message=(
+                "Missing required event indicator column ('event' or 'churn'). "
+                "Required for survival benchmarking. If providing unlabeled data for scoring, "
+                "omit both duration and event to activate inference-only mode."
+            )
         )
 
     # 5. Check customer / business features (supports both Telco and adaptive Retail/SaaS columns)
@@ -399,11 +424,13 @@ def validate_customer_csv(
             df['duration'] = df['duration'].fillna(max(1.0, med_dur))
             warnings_list.append(f"Imputed missing duration values with cohort median ({med_dur:.1f} months).")
 
-        if df['event'].dtype == 'object':
+        if df['event'].dtype == 'object' or df['event'].dtype == 'bool':
             event_str = df['event'].astype(str).str.strip().str.lower()
             mapped_ev = event_str.map({
                 'yes': 1, 'y': 1, 'true': 1, '1': 1, '1.0': 1, 'churned': 1, 'churn': 1,
-                'no': 0, 'n': 0, 'false': 0, '0': 0, '0.0': 0, 'active': 0, 'retained': 0
+                't': 1, 'positive': 1, 'left': 1,
+                'no': 0, 'n': 0, 'false': 0, '0': 0, '0.0': 0, 'active': 0, 'retained': 0,
+                'f': 0, 'negative': 0, 'stayed': 0, 'loyal': 0
             })
             if mapped_ev.isna().any():
                 invalid_vals = df[mapped_ev.isna()]['event'].unique()[:3]

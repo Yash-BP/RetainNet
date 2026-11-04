@@ -27,14 +27,17 @@ if HAS_TORCH:
             return self.bn(x)
 
     class CoxPartialLikelihoodLoss(nn.Module):
-        """Negative Log Cox Partial Likelihood Loss for DeepSurv with numerical stabilization."""
+        """Negative Log Cox Partial Likelihood Loss for DeepSurv with numerical stabilization (Breslow ties)."""
         def __init__(self):
             super(CoxPartialLikelihoodLoss, self).__init__()
 
         def forward(self, risk_scores: torch.Tensor, T: torch.Tensor, E: torch.Tensor) -> torch.Tensor:
             risk_scores = risk_scores.view(-1)
-            # Clamp to prevent float32 exp overflow/underflow
-            risk_scores = torch.clamp(risk_scores, -20.0, 20.0)
+            # Subtract max for numerical stabilization (invariance to constant shifts)
+            if risk_scores.numel() > 0:
+                max_r = torch.max(risk_scores).detach()
+                risk_scores = risk_scores - max_r
+            risk_scores = torch.clamp(risk_scores, -30.0, 30.0)
             
             sorted_indices = torch.argsort(T, descending=True)
             T_sorted = T[sorted_indices]
@@ -54,7 +57,7 @@ if HAS_TORCH:
             last_occurrence_idx = torch.cumsum(counts, dim=0) - 1
             risk_set_sums = cumsum_exp_risk[last_occurrence_idx][inverse_indices]
 
-            log_cumsum_exp_risk = torch.log(risk_set_sums + 1e-8)
+            log_cumsum_exp_risk = torch.log(risk_set_sums + 1e-12)
 
             uncensored_likelihood = risk_scores - log_cumsum_exp_risk
             event_loss = -uncensored_likelihood * E.float()
@@ -92,7 +95,15 @@ class DeepSurvModel:
         self.baseline_times = None
         self.baseline_survival = None
 
-    def fit(self, X: np.ndarray, T: np.ndarray, E: np.ndarray, epochs: int = 150, batch_size: int = 256, seed: Optional[int] = None):
+    def fit(self, X: np.ndarray, T: np.ndarray, E: np.ndarray, epochs: int = 150, batch_size: Optional[int] = None, seed: Optional[int] = None):
+        """Fit DeepSurv with genuine PyTorch autograd and full-cohort Cox partial likelihood.
+        
+        To prevent the mathematical bias and high variance caused by truncating risk sets
+        to arbitrary mini-batches, risk sets include all eligible individuals in the cohort
+        at each event time. When batch_size is None or >= n_samples, full-cohort gradient
+        descent is performed. When batch_size < n_samples, full-cohort risk sets are
+        retained across event calculations.
+        """
         if not HAS_TORCH: raise ImportError('PyTorch is required for DeepSurv.')
         eff_seed = seed if seed is not None else self.random_state
         if eff_seed is not None:
@@ -118,21 +129,31 @@ class DeepSurvModel:
         self.network.train()
         n_samples = len(X_arr)
 
-        for epoch in range(epochs):
-            perm = torch.randperm(n_samples)
-            X_shuffled, T_shuffled, E_shuffled = X_tensor[perm], T_tensor[perm], E_tensor[perm]
-
-            for i in range(0, n_samples, batch_size):
-                x_b = X_shuffled[i:i+batch_size]
-                t_b = T_shuffled[i:i+batch_size]
-                e_b = E_shuffled[i:i+batch_size]
-
+        if batch_size is None or batch_size >= n_samples:
+            # Full-cohort exact Cox partial likelihood
+            for epoch in range(epochs):
                 optimizer.zero_grad()
-                risk_pred = self.network(x_b)
-                loss = criterion(risk_pred, t_b, e_b)
+                risk_pred = self.network(X_tensor)
+                loss = criterion(risk_pred, T_tensor, E_tensor)
                 if loss.requires_grad:
                     loss.backward()
                     optimizer.step()
+        else:
+            # Mini-batch gradient updates with dynamically refreshed full-cohort risk-set denominators
+            for epoch in range(epochs):
+                perm = torch.randperm(n_samples)
+                for i in range(0, n_samples, batch_size):
+                    batch_idx = perm[i:i+batch_size]
+                    optimizer.zero_grad()
+                    with torch.no_grad():
+                        risk_full = self.network(X_tensor)
+                    risk_pred_batch = self.network(X_tensor[batch_idx])
+                    risk_combined = risk_full.clone()
+                    risk_combined[batch_idx] = risk_pred_batch
+                    loss = criterion(risk_combined, T_tensor, E_tensor)
+                    if loss.requires_grad:
+                        loss.backward()
+                        optimizer.step()
 
         self.network.eval()
         with torch.no_grad():
@@ -204,4 +225,7 @@ class DeepSurvModel:
         s0_interp = np.interp(times_arr, b_times, b_surv, left=1.0, right=b_surv[-1])
         
         isd = np.power(s0_interp[np.newaxis, :], risk_scores[:, np.newaxis])
-        return np.clip(isd, 0.0, 1.0)
+        isd = np.clip(isd, 0.0, 1.0)
+        if len(times_arr) > 1 and np.all(np.diff(times_arr) >= 0):
+            isd = np.minimum.accumulate(isd, axis=1)
+        return isd

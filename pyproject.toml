@@ -6,7 +6,6 @@ build-backend = "setuptools.build_meta"
 name = "retainnet"
 version = "1.0.0"
 description = "RetainNet: Deep Survival Analysis Framework for Dynamic CLTV & Churn Mitigation"
-readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.23.0",
@@ -27,4 +26,5 @@ python_files = ["test_*.py"]
 filterwarnings = [
     "ignore:scikit-survival is not installed.*:RuntimeWarning",
     "ignore:.*missing ScriptRunContext.*:UserWarning",
+    "ignore:Could not find the number of physical cores.*:UserWarning",
 ]

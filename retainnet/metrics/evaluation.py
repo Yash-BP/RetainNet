@@ -10,7 +10,7 @@ except ImportError:
 
 
 class Evaluator:
-    """Survival Analysis Evaluation Engine with Graf et al. IPCW weighting."""
+    """Survival Analysis Evaluation Engine with Graf et al. IPCW weighting and Haider et al. D-Calibration."""
     
     @staticmethod
     def c_index(event_times: np.ndarray, predicted_scores: np.ndarray, event_observed: np.ndarray) -> float:
@@ -21,7 +21,10 @@ class Evaluator:
         if len(event_times) == 0:
             return 0.5
         if HAS_LIFELINES:
-            return float(concordance_index(event_times, predicted_scores, event_observed))
+            try:
+                return float(concordance_index(event_times, predicted_scores, event_observed))
+            except ZeroDivisionError:
+                return 0.5
         else:
             def _valid_comparison(time_a, time_b, event_a, event_b):
                 if time_a == time_b:
@@ -175,7 +178,7 @@ class Evaluator:
         risk_scores: Optional[np.ndarray] = None
     ) -> Dict[str, Any]:
         """
-        Evaluates a survival model's predictions. Raises or reports actual errors without fabricating metrics.
+        Evaluates a survival model's predictions: C-Index, Brier scores, IBS, and D-Calibration.
         """
         if np.isnan(surv_matrix).any():
             raise ValueError(f"surv_matrix contains NaN values for {model_name}")
@@ -197,17 +200,33 @@ class Evaluator:
         bs_24 = _get_bs(24.0)
         bs_36 = _get_bs(36.0)
 
-        # Compute D-Calibration across subjects at their observed/censored times
-        surv_at_t_obs = []
+        # D-Calibration across subjects using Haider et al. (2020) fractional probability distribution for censored subjects
+        n_bins = 10
+        bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+        observed_counts = np.zeros(n_bins, dtype=float)
+
         for i in range(len(event_times)):
             t_i = float(event_times[i])
             idx_i = int(np.abs(time_grid - t_i).argmin())
             s_i = float(surv_matrix[i, idx_i]) if idx_i < surv_matrix.shape[1] else 0.5
-            if int(event_observed[i]) == 0:
-                # Right-censored at t_i: uniform survival draw in [0, S(t_i)] per Haider et al. (2020)
-                s_i = 0.5 * s_i
-            surv_at_t_obs.append(s_i)
-        dcal = cls.d_calibration(np.asarray(surv_at_t_obs, dtype=float), n_bins=10)
+            s_i = float(np.clip(s_i, 0.0, 1.0))
+
+            if int(event_observed[i]) == 1:
+                # Uncensored: point mass in the bin containing s_i
+                b_idx = min(int(s_i * n_bins), n_bins - 1)
+                observed_counts[b_idx] += 1.0
+            else:
+                # Right-censored at t_i: true survival at failure lies uniformly in [0, S(t_i)] (Haider et al. 2020)
+                if s_i <= 1e-6:
+                    observed_counts[0] += 1.0
+                else:
+                    for b in range(n_bins):
+                        low = bin_edges[b]
+                        high = bin_edges[b + 1]
+                        overlap = max(0.0, min(high, s_i) - low)
+                        observed_counts[b] += overlap / s_i
+
+        dcal = cls.d_calibration_from_counts(observed_counts)
         d_p = dcal.get("p_value")
         d_chi2 = dcal.get("chi2_statistic")
         if d_p is not None and d_chi2 is not None:
@@ -230,6 +249,7 @@ class Evaluator:
 
     @staticmethod
     def d_calibration(surv_pred_at_event: np.ndarray, n_bins: int = 10) -> Dict[str, Any]:
+        """D-Calibration goodness-of-fit test from raw predicted survival array."""
         try:
             from scipy.stats import chisquare
             bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
@@ -239,6 +259,26 @@ class Evaluator:
             
             chi2_stat, p_value = chisquare(observed_counts, f_exp=expected_counts)
             
+            return {
+                "chi2_statistic": float(np.round(chi2_stat, 4)),
+                "p_value": float(np.round(p_value, 4)),
+                "is_calibrated": bool(p_value >= 0.05),
+                "bin_counts": observed_counts.tolist()
+            }
+        except Exception:
+            return {"chi2_statistic": None, "p_value": None, "is_calibrated": None, "bin_counts": []}
+
+    @staticmethod
+    def d_calibration_from_counts(observed_counts: np.ndarray) -> Dict[str, Any]:
+        """D-Calibration goodness-of-fit test from accumulated (fractional) bin counts."""
+        try:
+            from scipy.stats import chisquare
+            n_bins = len(observed_counts)
+            total = float(np.sum(observed_counts))
+            if total <= 0:
+                return {"chi2_statistic": None, "p_value": None, "is_calibrated": None, "bin_counts": []}
+            expected_counts = np.full(n_bins, total / n_bins)
+            chi2_stat, p_value = chisquare(observed_counts, f_exp=expected_counts)
             return {
                 "chi2_statistic": float(np.round(chi2_stat, 4)),
                 "p_value": float(np.round(p_value, 4)),

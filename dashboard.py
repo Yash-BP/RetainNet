@@ -22,6 +22,7 @@ warnings.filterwarnings("ignore", message=".*chardet.*")
 warnings.filterwarnings("ignore", message=".*charset_normalizer.*")
 # -----------------------------------------------------------------------------
 
+import gc
 import io
 import json
 import math
@@ -1210,6 +1211,75 @@ def execute_retainnet_pipeline() -> Dict[str, Any]:
             with open(cache_path, "rb") as f:
                 cached_res = pickle.load(f)
             if isinstance(cached_res, dict) and "df_active" in cached_res and "trained_bundle" in cached_res:
+                for p_key in ("ibm_payload", "weibull_payload"):
+                    if p_key in cached_res and isinstance(cached_res[p_key], dict):
+                        p = cached_res[p_key]
+                        c_db = p.get("customer_db")
+                        if c_db is None:
+                            c_db = {}
+                            p["customer_db"] = c_db
+                        compact = p.get("compact_customers", [])
+                        if compact and len(c_db) < len(compact):
+                            for r in compact:
+                                cid = r[0]
+                                if cid not in c_db:
+                                    t_m = r[1]
+                                    a_val = float(r[2])
+                                    c_name = r[11] if len(r) > 11 else ("Month-to-Month" if r[3] == 0 else ("One Year" if r[3] == 1 else "Two Year"))
+                                    r12 = float(r[4])
+                                    c_ltv = float(r[6]) if len(r) > 6 else 0.0
+                                    seg, urg, bdg, presc, haz, scn = classify_customer_retention_tier(
+                                        ret12=r12,
+                                        arpu=a_val,
+                                        contract_name=c_name,
+                                        support_tickets=0
+                                    )
+                                    drivers = []
+                                    if r[3] == 0:
+                                        drivers.append("Month-to-Month Contract (+Hazard)")
+                                    elif r[3] == 2:
+                                        drivers.append("Two-Year Lock-In (-Hazard)")
+                                    if a_val >= 80.0:
+                                        drivers.append(f"High Monthly ARPU (${a_val:.0f}/mo)")
+                                    elif a_val <= 35.0:
+                                        drivers.append(f"Low Price Sensitivity (${a_val:.0f}/mo)")
+                                    if t_m <= 6:
+                                        drivers.append(f"Early Onboarding Tenure ({t_m}M)")
+                                    elif t_m >= 36:
+                                        drivers.append(f"Established Loyalty Tenure ({t_m}M)")
+                                    if not drivers:
+                                        drivers.append("Moderate Baseline Utilization Profile")
+
+                                    c_dsurv = r[7] if len(r) > 7 else []
+                                    c_cox = r[8] if len(r) > 8 else []
+                                    c_rsf = r[9] if len(r) > 9 else []
+                                    c_dhit = r[10] if len(r) > 10 else []
+
+                                    c_db[cid] = {
+                                        "id": cid,
+                                        "tenure": f"{t_m} Months",
+                                        "arpu": f"${a_val:.2f}",
+                                        "arpu_num": round(a_val, 2),
+                                        "contract": c_name,
+                                        "segment": seg,
+                                        "urgency": urg,
+                                        "badgeClass": bdg,
+                                        "prescription": presc,
+                                        "riskDrivers": " • ".join(drivers),
+                                        "hazard": haz,
+                                        "ltv": f"${c_ltv:,.2f}",
+                                        "ltv_num": round(c_ltv, 2),
+                                        "roiText": f"+${max(50.0, c_ltv * 0.12):,.2f}",
+                                        "ret12": f"{int(round(r12))}%",
+                                        "ret12_num": round(r12, 1),
+                                        "curve": c_dsurv,
+                                        "curves": {
+                                            "deepsurv": c_dsurv,
+                                            "coxph": c_cox,
+                                            "rsf": c_rsf,
+                                            "deephit": c_dhit,
+                                        },
+                                    }
                 return cached_res
         except Exception:
             pass
@@ -1352,6 +1422,7 @@ def execute_retainnet_pipeline() -> Dict[str, Any]:
         "ibm_dsurv_mean_curve": np.mean(dsurv_isd, axis=0),
         "ref_drift_bars": ref_drift_bars,
     }
+    gc.collect()
 
     is_real_telco = getattr(df_ibm, "attrs", {}).get("is_real", False)
     ibm_source_label = "IBM Telco Dataset (Loaded CSV)" if is_real_telco else "Synthetic Telco Benchmark Cohort"
@@ -1373,6 +1444,7 @@ def execute_retainnet_pipeline() -> Dict[str, Any]:
         is_inference_only=False,
         is_synthetic_demo=True,
     )
+    gc.collect()
 
     step_16 = max(1, len(time_grid) // 16)
     idx_16 = list(range(0, len(time_grid), step_16))[:16]
@@ -1478,20 +1550,18 @@ def execute_retainnet_pipeline() -> Dict[str, Any]:
         }
         models_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".models_cache.pkl")
         with open(models_path, "wb") as f:
-            pickle.dump(models_bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(models_bundle, f, protocol=4)
 
         # 2. Save slim pipeline cache for sub-second startup
         slim_trained = {
             k: v for k, v in trained_bundle.items()
             if k not in model_keys
         }
-        p_cid = ibm_payload.get("primary_cid")
         slim_ibm = dict(ibm_payload)
-        slim_ibm["customer_db"] = {p_cid: ibm_payload["customer_db"][p_cid]} if p_cid and p_cid in ibm_payload.get("customer_db", {}) else {}
+        slim_ibm["customer_db"] = dict(ibm_payload.get("customer_db", {}))
 
-        w_cid = weibull_payload.get("primary_cid")
         slim_weibull = dict(weibull_payload)
-        slim_weibull["customer_db"] = {w_cid: weibull_payload["customer_db"][w_cid]} if w_cid and w_cid in weibull_payload.get("customer_db", {}) else {}
+        slim_weibull["customer_db"] = dict(weibull_payload.get("customer_db", {}))
 
         slim_pipeline_res = dict(pipeline_res)
         slim_pipeline_res["trained_bundle"] = slim_trained
@@ -1499,7 +1569,8 @@ def execute_retainnet_pipeline() -> Dict[str, Any]:
         slim_pipeline_res["weibull_payload"] = slim_weibull
 
         with open(cache_path, "wb") as f:
-            pickle.dump(slim_pipeline_res, f, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(slim_pipeline_res, f, protocol=4)
+        gc.collect()
     except Exception:
         pass
     return pipeline_res

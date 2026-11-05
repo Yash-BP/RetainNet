@@ -1,3 +1,4 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 # RetainNet: Deep Survival Analysis Framework for Dynamic CLTV & Churn Mitigation
 # Core runtime dependencies documented in RETAINNET_FULL_PROJECT_DOCUMENTATION.txt (Section 6.1)
 torch

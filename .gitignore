@@ -39,6 +39,9 @@ venv.bak/
 htmlcov/
 .hypothesis/
 
+# Local model and pipeline caches
+*.pkl
+
 # Streamlit local runtime state
 .streamlit/secrets.toml
 

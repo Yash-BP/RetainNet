@@ -2,6 +2,9 @@
 import os
 import sys
 
+# Fallback CPU core limit before importing loky/sklearn to prevent Windows wmic lookup noise
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 4))
+
 _root_dir = os.path.dirname(os.path.abspath(__file__))
 if _root_dir in sys.path:
     sys.path.remove(_root_dir)

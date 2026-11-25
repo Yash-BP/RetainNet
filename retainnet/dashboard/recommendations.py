@@ -34,7 +34,7 @@ def classify_customer_retention_tier(
     is_high_arpu = arpu >= 75.0
     has_support_friction = support_tickets >= 3
 
-    if ret12_clipped < 35.0:
+    if ret12_clipped < 50.0:
         segment = "High Risk Segment"
         urgency = "High Priority"
         badge_class = "bg-red-100 text-red-800"

@@ -135,7 +135,7 @@ Evaluated on the IBM Telco benchmark dataset using an unbiased, 100% evaluated h
 | **DeepHit Discrete Engine** | 0.6027 | 0.1569 | 0.1685 | 0.1812 | 0.1601 |
 | **Random Survival Forest** | 0.5950 | 0.2123 | 0.2014 | 0.2240 | 0.2115 |
 
-*Note: In compliance with sound evaluation methodology, Stage 2 filtering was restricted strictly to the training split (retaining 91.7% of training signal), ensuring zero data leakage and 0% test set filtering.*
+*Note: In compliance with sound evaluation methodology, Stage 2 filtering is optional on the training split (disabled by default in the dashboard/CLI pipeline, retaining 100.0% of training signal), ensuring zero data leakage and 0% test set filtering.*
 
 ---
 

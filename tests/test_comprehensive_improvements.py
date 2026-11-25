@@ -195,6 +195,42 @@ class TestComprehensiveImprovements(unittest.TestCase):
         self.assertFalse(res.df["total_charges"].isna().any())
         self.assertFalse(res.df["contract_type"].isna().any())
 
+    def test_search_subscribers_compact_fallback_and_segments(self):
+        """Verify search_subscribers compact_customers fallback maps tuple indices cleanly and all segments are populated."""
+        from dashboard import search_subscribers, _strip_heavy_customer_db_for_json
+
+        ibm = self.pipeline_output["ibm_payload"]
+        stripped = _strip_heavy_customer_db_for_json(ibm)
+        self.assertEqual(stripped["customer_db"], {})
+
+        for seg in ("High Risk Segment", "Moderate Risk Segment", "Stable Retention"):
+            matches = search_subscribers(stripped, seg)
+            self.assertGreater(len(matches), 0, f"Expected non-zero rows for {seg}")
+
+        first_cid = ibm["primary_cid"]
+        by_id = search_subscribers(stripped, first_cid)
+        self.assertEqual(len(by_id), 1)
+        self.assertEqual(by_id[0]["ltv"], ibm["customer_db"][first_cid]["ltv"])
+        self.assertEqual(by_id[0]["ret12"], ibm["customer_db"][first_cid]["ret12"])
+
+    def test_dashboard_ui_controls_and_config_consistency(self):
+        """Verify dashboard UI controls, JS KPI sync hooks, and config integrity."""
+        dash_path = os.path.join(_root_dir, "dashboard.py")
+        with open(dash_path, "r", encoding="utf-8") as f:
+            src = f.read()
+
+        self.assertIn('page_icon="🛡️"', src)
+        self.assertNotIn('page_icon="favicon.png"', src)
+        for seg in ("High Risk Segment", "Moderate Risk Segment", "Stable Retention"):
+            self.assertIn(f'<option value="{seg}">{seg}</option>', src)
+        self.assertIn('id="sim-discount-slider" min="0" max="30"', src)
+        self.assertIn("getElementById('pipe-ibs')", src)
+        self.assertIn("getElementById('mlops-drift')", src)
+        self.assertIn("evaluateClientLeaderboard(", src)
+        self.assertIn("interpCurveAt(", src)
+        self.assertNotIn("animate-pulse", src)
+        self.assertNotIn("animate-ping", src)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -39,8 +39,10 @@ venv.bak/
 htmlcov/
 .hypothesis/
 
-# Local model and pipeline caches
+# Local model and pipeline caches (keep precomputed runtime caches tracked)
 *.pkl
+!.pipeline_cache.pkl
+!.models_cache.pkl
 
 # Streamlit local runtime state
 .streamlit/secrets.toml

@@ -1282,8 +1282,8 @@ def execute_retainnet_pipeline() -> Dict[str, Any]:
                                         },
                                     }
                 return cached_res
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[RetainNet] Cache load skipped: {exc}")
 
     from sklearn.model_selection import train_test_split
     from sklearn.preprocessing import StandardScaler

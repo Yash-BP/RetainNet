@@ -779,8 +779,8 @@ def ensure_models_loaded(trained_bundle: Dict[str, Any]) -> Dict[str, Any]:
                     models_dict = pickle.load(f)
                 if isinstance(models_dict, dict):
                     trained_bundle.update(models_dict)
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[RetainNet] Models cache load skipped: {exc}")
     return trained_bundle
 
 
